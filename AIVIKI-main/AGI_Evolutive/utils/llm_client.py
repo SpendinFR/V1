@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import socket
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
 from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -18,10 +19,31 @@ JSON_ONLY_DIRECTIVE = (
 )
 
 
+def _json_default(value: Any) -> Any:
+    """Best-effort converter for objects that ``json.dumps`` cannot handle."""
+
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return value.to_dict()  # type: ignore[return-value]
+        except TypeError:
+            pass
+    if hasattr(value, "__dict__"):
+        return {
+            key: attr
+            for key, attr in vars(value).items()
+            if not callable(attr) and not key.startswith("__")
+        }
+    return str(value)
+
+
 def _ensure_text(value: Any) -> str:
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    return json.dumps(value, ensure_ascii=False, indent=2, default=_json_default)
 
 
 def build_json_prompt(
