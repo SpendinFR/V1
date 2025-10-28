@@ -26,7 +26,15 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return default
 
 
-_DEFAULT_ENABLED = _env_flag("AGI_ENABLE_LLM") and not _env_flag("AGI_DISABLE_LLM")
+
+
+def _llm_env_enabled() -> bool:
+    """Resolve the current LLM availability from the environment."""
+
+    return _env_flag("AGI_ENABLE_LLM") and not _env_flag("AGI_DISABLE_LLM")
+
+
+_DEFAULT_ENABLED = _llm_env_enabled()
 
 
 class LLMIntegrationError(RuntimeError):
@@ -91,7 +99,7 @@ class LLMIntegrationManager:
         enabled: Optional[bool] = None,
     ) -> None:
         self._client = client or OllamaLLMClient()
-        self._enabled = _DEFAULT_ENABLED if enabled is None else bool(enabled)
+        self._enabled = _llm_env_enabled() if enabled is None else bool(enabled)
         self._model_configs: MutableMapping[str, OllamaModelConfig] = dict(model_configs or {})
         self._lock = threading.Lock()
 
@@ -183,7 +191,7 @@ def is_llm_enabled() -> bool:
     manager = _default_manager
     if manager is not None:
         return manager.enabled
-    return _DEFAULT_ENABLED
+    return _llm_env_enabled()
 
 
 def try_call_llm_dict(

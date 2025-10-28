@@ -1,4 +1,5 @@
 # 🚀 main.py - Point d'entrée AGI Évolutive
+import argparse
 import glob
 import json
 import logging
@@ -106,7 +107,7 @@ from AGI_Evolutive.language import OnlineNgramClassifier
 from AGI_Evolutive.memory.concept_extractor import ConceptExtractor
 from AGI_Evolutive.memory.prefs_bridge import PrefsBridge as PreferencesAdapter
 from AGI_Evolutive.utils.logging_setup import configure_logging
-from AGI_Evolutive.utils.llm_service import get_llm_manager
+from AGI_Evolutive.utils.llm_service import get_llm_manager, set_llm_manager
 
 BANNER = """
 ╔══════════════════════════════════════════════╗
@@ -312,7 +313,7 @@ def list_inbox(inbox_dir="inbox"):
     else:
         print("📁 Inbox :", ", ".join(files))
 
-def run_cli():
+def run_cli(*, disable_llm: bool = False):
     log_path = configure_logging()
     logger = logging.getLogger(__name__)
 
@@ -321,7 +322,17 @@ def run_cli():
     print("Chargement de l'architecture cognitive…")
 
     llm_auto_enabled = False
-    if not os.getenv("AGI_DISABLE_LLM"):
+    if disable_llm:
+        os.environ["AGI_DISABLE_LLM"] = "1"
+        try:
+            get_llm_manager().set_enabled(False)
+        except Exception:
+            try:
+                set_llm_manager(None)
+            except Exception:
+                pass
+
+    if not disable_llm and not os.getenv("AGI_DISABLE_LLM"):
         try:
             manager = get_llm_manager()
             if not manager.enabled:
@@ -1163,5 +1174,20 @@ def run_cli():
             print("❓", q["text"])
     logger.info("Session CLI terminée")
 
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Lance la CLI AGI Évolutive",
+    )
+    parser.add_argument(
+        "--nollm",
+        action="store_true",
+        help="Désactive l'intégration automatique du LLM au démarrage",
+    )
+    args = parser.parse_args(argv)
+
+    run_cli(disable_llm=args.nollm)
+
+
 if __name__ == "__main__":
-    run_cli()
+    main()
