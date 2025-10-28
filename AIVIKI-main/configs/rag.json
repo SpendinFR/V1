@@ -1,0 +1,33 @@
+{
+  "retrieval": {
+    "topk_dense": 200,
+    "topk_sparse": 100,
+    "topk_fused": 80,
+    "alpha_dense": 0.6,
+    "beta_sparse": 0.4,
+    "recency_boost": 0.2,
+    "recency_half_life_days": 14.0
+  },
+  "ann": {
+    "backend": "faiss",
+    "hnsw": true,
+    "efSearch": 128,
+    "M": 32,
+    "metric": "ip"
+  },
+  "rerank": {
+    "topk": 30,
+    "mmr_lambda": 0.7
+  },
+  "compose": {
+    "budget_tokens": 1500,
+    "snippet_chars": 420,
+    "tokenizer": "bert-base-multilingual-cased"
+  },
+  "guards": {
+    "min_support_docs": 2,
+    "min_support_score": 0.15,
+    "min_top1_score": 0.25,
+    "refuse_message": "Je ne peux pas répondre de façon fiable : support insuffisant. Peux-tu préciser la question ou partager une source ?"
+  }
+}

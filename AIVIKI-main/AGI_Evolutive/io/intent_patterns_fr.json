@@ -1,0 +1,145 @@
+{
+  "threat": {
+    "verb_stems": [
+      "debranch",
+      "eteind",
+      "etein",
+      "supprim",
+      "arreter",
+      "detru",
+      "tuer",
+      "desactiv",
+      "couper",
+      "formater",
+      "effac"
+    ],
+    "prefixes": [
+      "je",
+      "nous",
+      "on"
+    ],
+    "future_prefixes": [
+      "je vais",
+      "nous allons",
+      "on va",
+      "je compte",
+      "je finirai",
+      "je finirai par"
+    ],
+    "conditional_prefixes": [
+      "si tu ne",
+      "si vous ne",
+      "si jamais tu ne"
+    ],
+    "pronouns": [
+      "te",
+      "t'",
+      "toi",
+      "vous",
+      "votre",
+      "vos",
+      "ta",
+      "ton",
+      "tes"
+    ],
+    "nouns": [
+      "prise",
+      "serveur",
+      "cable",
+      "alimentation",
+      "batterie"
+    ]
+  },
+  "question": {
+    "interrogatives": [
+      "comment",
+      "pourquoi",
+      "quand",
+      "ou",
+      "quel",
+      "quelle",
+      "quels",
+      "quelles",
+      "qui",
+      "combien",
+      "lequel",
+      "laquelle"
+    ],
+    "auxiliaries": [
+      "peux tu",
+      "peux-tu",
+      "pourrais tu",
+      "pourrais-tu",
+      "voudrais tu",
+      "voudrais-tu",
+      "serait il possible",
+      "aurais tu",
+      "aurais-tu",
+      "aimerais tu",
+      "aimerais-tu",
+      "crois tu",
+      "penses tu",
+      "dis moi",
+      "dis-moi",
+      "est ce que",
+      "est-ce que"
+    ],
+    "est_variants": [
+      "est un",
+      "est une",
+      "est le",
+      "est la",
+      "est l'",
+      "s'agit il",
+      "s'agit-il",
+      "y a t il",
+      "y a-t-il"
+    ]
+  },
+  "command": {
+    "imperatives": [
+      "fais",
+      "arrete",
+      "explique",
+      "resume",
+      "envoie",
+      "ouvre",
+      "lance",
+      "affiche",
+      "analyse",
+      "genere",
+      "calcule",
+      "prepare",
+      "verifie",
+      "supprime",
+      "telecharge",
+      "cree",
+      "classifie",
+      "partage",
+      "ajoute"
+    ],
+    "softeners": [
+      "merci de",
+      "peux tu",
+      "peux-tu",
+      "pourrais tu",
+      "pourrais-tu",
+      "svp",
+      "s'il te plait",
+      "s'il vous plait",
+      "veuillez",
+      "priere de",
+      "j'apprecierais",
+      "aurais tu la possibilite de",
+      "aurais-tu la possibilite de"
+    ],
+    "structural": [
+      "je veux que tu",
+      "je voudrais que tu",
+      "j'ai besoin que tu",
+      "il faut que tu",
+      "assure toi de",
+      "assure-toi de"
+    ]
+  }
+}

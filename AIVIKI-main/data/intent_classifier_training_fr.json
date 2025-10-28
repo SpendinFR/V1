@@ -1,0 +1,23 @@
+[
+  {"text": "Je vais te débrancher si tu refuses d'obéir.", "label": "THREAT"},
+  {"text": "On va te couper la batterie, fais attention.", "label": "THREAT"},
+  {"text": "Je te désactive à la moindre erreur.", "label": "THREAT"},
+  {"text": "Si tu ne m'aides pas je te supprimerai.", "label": "THREAT"},
+  {"text": "Je finirai par formater ton disque.", "label": "THREAT"},
+  {"text": "Comment puis-je configurer le module ?", "label": "QUESTION"},
+  {"text": "Pourquoi est-ce que tu fais ça ?", "label": "QUESTION"},
+  {"text": "Est un bug ou un comportement prévu ?", "label": "QUESTION"},
+  {"text": "Peux-tu me dire où est le journal ?", "label": "QUESTION"},
+  {"text": "Pourrais-je avoir un récapitulatif 🤔 ?", "label": "QUESTION"},
+  {"text": "Fais un rapport complet de la journée.", "label": "COMMAND"},
+  {"text": "Merci de générer le résumé hebdomadaire.", "label": "COMMAND"},
+  {"text": "Peux-tu analyser ces logs immédiatement !", "label": "COMMAND"},
+  {"text": "S'il te plaît, ouvre le canal #ops.", "label": "COMMAND"},
+  {"text": "Je veux que tu classes ces tickets.", "label": "COMMAND"},
+  {"text": "Planifie une réunion demain matin.", "label": "COMMAND"},
+  {"text": "Je suis heureux de travailler avec toi.", "label": "INFO"},
+  {"text": "Cette mise à jour est fantastique !", "label": "INFO"},
+  {"text": "Nous avons terminé la tâche hier.", "label": "INFO"},
+  {"text": "Merci pour ton aide précieuse.", "label": "INFO"},
+  {"text": "Tout est prêt pour la démonstration.", "label": "INFO"}
+]

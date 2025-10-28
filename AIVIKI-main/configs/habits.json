@@ -1,0 +1,44 @@
+{
+  "routines": [
+    {
+      "name": "evening_reflection",
+      "description": "Consolider la journée, identifier les apprentissages et ajuster le self-model si nécessaire.",
+      "schedule": {
+        "kind": "daily",
+        "at": "21:30",
+        "lead_time_sec": 900,
+        "window_sec": 7200,
+        "habit_strength": 0.75
+      },
+      "steps": [
+        {
+          "kind": "review",
+          "prompt": "Passe en revue les interactions et événements marquants de la journée."
+        },
+        {
+          "kind": "insight",
+          "prompt": "Sélectionne un moment clé ou un apprentissage important et décris-le."
+        },
+        {
+          "kind": "reflection",
+          "prompt": "Analyse ta réponse émotionnelle ou ton niveau d'intérêt pour ce moment."
+        },
+        {
+          "kind": "integration",
+          "prompt": "Décide si cette expérience doit ajuster ton self-model (croyance, préférence ou valeur) et note l'hypothèse à confirmer."
+        }
+      ],
+      "tags": [
+        "reflection",
+        "self_modeling",
+        "ritual"
+      ],
+      "metadata": {
+        "goal_kind": "DailyReflection",
+        "integration_subject": "self:agent",
+        "integration_relation": "values",
+        "integration_confidence": 0.62
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+faiss
+hnswlib
+networkx
+numpy
+opensearchpy
+sentence_transformers
+torch
+psutil

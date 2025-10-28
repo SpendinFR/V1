@@ -1,0 +1,47 @@
+{
+  "pipelines": [
+    {
+      "name": "GOAL_FAST_TRACK",
+      "family": "GOAL",
+      "priority": 5,
+      "description": "fast-track",
+      "metadata": {
+        "source": "configs/pipelines.json"
+      },
+      "condition": {
+        "meta.immediacy": {"gte": 0.7}
+      },
+      "steps": [
+        {"stage": "PERCEIVE"},
+        {"stage": "ATTEND"},
+        {"stage": "INTERPRET"},
+        {"stage": "EVALUATE"},
+        {"stage": "DECIDE"},
+        {"stage": "ACT", "mode_selector": "reflex_if_immediate"},
+        {"stage": "FEEDBACK"},
+        {"stage": "LEARN"},
+        {"stage": "UPDATE"}
+      ]
+    },
+    {
+      "name": "GOAL_LOW_IMPORTANCE",
+      "family": "GOAL",
+      "priority": 10,
+      "description": "low-importance",
+      "metadata": {
+        "source": "configs/pipelines.json"
+      },
+      "condition": "low_importance",
+      "steps": [
+        {"stage": "PERCEIVE"},
+        {"stage": "ATTEND"},
+        {"stage": "INTERPRET"},
+        {"stage": "DECIDE"},
+        {"stage": "ACT", "mode_selector": "habit_if_low_importance"},
+        {"stage": "FEEDBACK"},
+        {"stage": "LEARN"},
+        {"stage": "UPDATE"}
+      ]
+    }
+  ]
+}

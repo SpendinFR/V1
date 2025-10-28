@@ -1,0 +1,9 @@
+{
+  "lexicon_retention": {
+    "decay": 0.995,
+    "floor_alpha_beta": 1.0,
+    "dormant_after_days": 60,
+    "revive_boost": 0.4,
+    "archive_path": "data/lexicon_archive.json"
+  }
+}
