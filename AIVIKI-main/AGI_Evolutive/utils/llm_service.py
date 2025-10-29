@@ -1,12 +1,13 @@
 """Service layer to orchestrate repository-wide LLM integrations."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from itertools import islice
 
@@ -65,6 +66,51 @@ class LLMCallRecord:
 
 _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
+_URGENT_ACTIVE_CHECK: Optional[Callable[[], bool]] = None
+_URGENT_ALLOWANCE_CHECK: Optional[Callable[[], bool]] = None
+_BASE_URGENT_STATE = False
+_MANUAL_URGENT_COUNT = 0
+_GLOBAL_URGENT_STATE = False
+_URGENT_STATE_LOCK = threading.Lock()
+_URGENT_CLEAR_EVENT = threading.Event()
+_URGENT_CLEAR_EVENT.set()
+
+
+class _RecentDuplicateFilter(logging.Filter):
+    """Filter to drop immediate duplicate log records for readability."""
+
+    def __init__(self, *, window: float = 0.25) -> None:
+        super().__init__()
+        self._window = float(window)
+        self._lock = threading.Lock()
+        self._last_key: Optional[Tuple[str, int]] = None
+        self._last_ts: float = 0.0
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - logging side effect
+        message = record.getMessage()
+        key = (message, getattr(record, "thread", 0))
+        now = float(getattr(record, "created", time.time()))
+        with self._lock:
+            if self._last_key == key and (now - self._last_ts) < self._window:
+                return False
+            self._last_key = key
+            self._last_ts = now
+        return True
+
+
+LOGGER = logging.getLogger(__name__)
+_has_dup_filter = any(isinstance(flt, _RecentDuplicateFilter) for flt in LOGGER.filters)
+if not _has_dup_filter:
+    LOGGER.addFilter(_RecentDuplicateFilter())
+
+
+def _describe_current_thread() -> str:
+    thread = threading.current_thread()
+    ident = getattr(thread, "ident", None)
+    if ident is None:
+        return thread.name
+    return f"{thread.name}#{ident}"
+
 
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
@@ -78,6 +124,145 @@ def _record_activity(spec_key: str, status: str, message: Optional[str] = None) 
         )
     except Exception:  # pragma: no cover - defensive guard for diagnostics
         pass
+
+
+def _await_urgent_clearance(
+    spec_key: str,
+    *,
+    logger: Optional[Any] = None,
+    thread_label: Optional[str] = None,
+) -> Tuple[float, str]:
+    """Block the caller until no urgent chain is active (unless permitted)."""
+
+    if thread_label is None:
+        thread_label = _describe_current_thread()
+
+    wait_started: Optional[float] = None
+
+    while True:
+        active = _is_global_urgent_active()
+        if not active and _URGENT_ACTIVE_CHECK is not None:
+            try:
+                active = bool(_URGENT_ACTIVE_CHECK())
+            except Exception:
+                active = False
+        if not active:
+            break
+
+        allowed = False
+        if _URGENT_ALLOWANCE_CHECK is not None:
+            try:
+                allowed = bool(_URGENT_ALLOWANCE_CHECK())
+            except Exception:
+                allowed = False
+        if allowed:
+            break
+
+        if wait_started is None:
+            wait_started = time.time()
+            LOGGER.info(
+                "LLM spec '%s' en attente : chaîne urgente active (thread %s)",
+                spec_key,
+                thread_label,
+            )
+            if logger is not None:
+                try:
+                    logger.debug(
+                        "LLM integration '%s' en attente : chaîne urgente active",
+                        spec_key,
+                    )
+                except Exception:
+                    pass
+
+        _URGENT_CLEAR_EVENT.wait(timeout=0.2)
+
+    wait_duration = 0.0
+    if wait_started is not None:
+        wait_duration = time.time() - wait_started
+        if logger is not None:
+            try:
+                logger.debug(
+                    "LLM integration '%s' reprise après %.2fs d'attente urgente",
+                    spec_key,
+                    wait_duration,
+                )
+            except Exception:
+                pass
+        LOGGER.info(
+            "LLM spec '%s' reprise après %.2fs (thread %s)",
+            spec_key,
+            wait_duration,
+            thread_label,
+        )
+
+    return wait_duration, thread_label
+
+
+def register_urgent_gate(
+    *,
+    check_active: Optional[Callable[[], bool]] = None,
+    allow_current: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Register callables used to gate background LLM usage during urgent chains."""
+
+    global _URGENT_ACTIVE_CHECK, _URGENT_ALLOWANCE_CHECK
+    _URGENT_ACTIVE_CHECK = check_active
+    _URGENT_ALLOWANCE_CHECK = allow_current
+
+    # Synchronise the cached urgent flag with the currently registered source so
+    # that late registrations (or reconfigurations after a restart) immediately
+    # reflect any active urgent window.  This prevents a short race where
+    # background threads could observe ``False`` in the cache before the first
+    # explicit update emitted by the job manager.
+    if check_active is not None:
+        try:
+            update_urgent_state(bool(check_active()))
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+
+def _recompute_global_urgent_state() -> None:
+    global _GLOBAL_URGENT_STATE
+    with _URGENT_STATE_LOCK:
+        combined = _BASE_URGENT_STATE or _MANUAL_URGENT_COUNT > 0
+        _GLOBAL_URGENT_STATE = combined
+    if combined:
+        _URGENT_CLEAR_EVENT.clear()
+    else:
+        _URGENT_CLEAR_EVENT.set()
+
+
+def update_urgent_state(active: bool) -> None:
+    """Cache the urgent flag so background threads can read it without RPC."""
+
+    global _BASE_URGENT_STATE
+    with _URGENT_STATE_LOCK:
+        _BASE_URGENT_STATE = bool(active)
+    _recompute_global_urgent_state()
+
+
+def manual_urgent_enter() -> None:
+    """Enter a manual urgent window outside of the job-manager bookkeeping."""
+
+    global _MANUAL_URGENT_COUNT
+    with _URGENT_STATE_LOCK:
+        _MANUAL_URGENT_COUNT += 1
+    _recompute_global_urgent_state()
+
+
+def manual_urgent_exit() -> None:
+    """Release a manual urgent window previously entered."""
+
+    global _MANUAL_URGENT_COUNT
+    with _URGENT_STATE_LOCK:
+        if _MANUAL_URGENT_COUNT > 0:
+            _MANUAL_URGENT_COUNT -= 1
+    _recompute_global_urgent_state()
+
+
+def _is_global_urgent_active() -> bool:
+    with _URGENT_STATE_LOCK:
+        return _GLOBAL_URGENT_STATE
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -117,9 +302,14 @@ class LLMIntegrationManager:
         input_payload: Any | None = None,
         extra_instructions: Optional[Sequence[str]] = None,
         max_retries: int = 1,
+        skip_urgent_gate: bool = False,
+        logger: Optional[Any] = None,
     ) -> LLMInvocation:
         if not self._enabled:
             raise LLMUnavailableError("LLM integration is disabled")
+
+        if not skip_urgent_gate:
+            _await_urgent_clearance(spec_key, logger=logger)
 
         spec = get_spec(spec_key)
         instructions: list[str] = list(spec.extra_instructions)
@@ -148,12 +338,16 @@ class LLMIntegrationManager:
         input_payload: Any | None = None,
         extra_instructions: Optional[Sequence[str]] = None,
         max_retries: int = 1,
+        skip_urgent_gate: bool = False,
+        logger: Optional[Any] = None,
     ) -> Mapping[str, Any]:
         invocation = self.call_json(
             spec_key,
             input_payload=input_payload,
             extra_instructions=extra_instructions,
             max_retries=max_retries,
+            skip_urgent_gate=skip_urgent_gate,
+            logger=logger,
         )
         parsed = invocation.result.parsed
         if not isinstance(parsed, Mapping):
@@ -211,10 +405,25 @@ def try_call_llm_dict(
     heuristics.
     """
 
+    thread_label = _describe_current_thread()
+    request_ts = time.time()
+
     if not is_llm_enabled():
+        LOGGER.info(
+            "LLM spec '%s' ignorée (LLM désactivé) – thread %s",
+            spec_key,
+            thread_label,
+        )
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         return None
 
+    _, thread_label = _await_urgent_clearance(
+        spec_key,
+        logger=logger,
+        thread_label=thread_label,
+    )
+
+    call_started_at = time.time()
     try:
         manager = get_llm_manager()
         payload = manager.call_dict(
@@ -222,10 +431,31 @@ def try_call_llm_dict(
             input_payload=input_payload,
             extra_instructions=extra_instructions,
             max_retries=max_retries,
+            skip_urgent_gate=True,
+            logger=logger,
+        )
+        now = time.time()
+        total_duration = now - request_ts
+        call_duration = now - call_started_at
+        LOGGER.info(
+            "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+            spec_key,
+            total_duration,
+            call_duration,
+            thread_label,
         )
         _record_activity(spec_key, "success", None)
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.warning(
+            "LLM spec '%s' indisponible après %.2fs – thread %s : %s",
+            spec_key,
+            total_duration,
+            thread_label,
+            exc,
+        )
         _record_activity(spec_key, "error", str(exc))
         if logger is not None:
             try:
@@ -236,6 +466,14 @@ def try_call_llm_dict(
                 pass
         return None
     except Exception as exc:  # pragma: no cover - unexpected failure safety net
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.exception(
+            "Erreur inattendue pour la spec LLM '%s' après %.2fs – thread %s",
+            spec_key,
+            total_duration,
+            thread_label,
+        )
         _record_activity(spec_key, "error", str(exc))
         if logger is not None:
             try:
@@ -256,9 +494,12 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "manual_urgent_enter",
+    "manual_urgent_exit",
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",
+    "register_urgent_gate",
     "set_llm_manager",
     "try_call_llm_dict",
 ]
