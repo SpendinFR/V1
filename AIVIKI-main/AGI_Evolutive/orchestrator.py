@@ -75,6 +75,8 @@ from AGI_Evolutive.utils.llm_service import (
     LLMUnavailableError,
     get_llm_manager,
     is_llm_enabled,
+    manual_urgent_enter,
+    manual_urgent_exit,
     try_call_llm_dict,
 )
 

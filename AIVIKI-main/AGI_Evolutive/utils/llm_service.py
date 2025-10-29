@@ -75,8 +75,33 @@ _URGENT_STATE_LOCK = threading.Lock()
 _URGENT_CLEAR_EVENT = threading.Event()
 _URGENT_CLEAR_EVENT.set()
 
+
+class _RecentDuplicateFilter(logging.Filter):
+    """Filter to drop immediate duplicate log records for readability."""
+
+    def __init__(self, *, window: float = 0.25) -> None:
+        super().__init__()
+        self._window = float(window)
+        self._lock = threading.Lock()
+        self._last_key: Optional[Tuple[str, int]] = None
+        self._last_ts: float = 0.0
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - logging side effect
+        message = record.getMessage()
+        key = (message, getattr(record, "thread", 0))
+        now = float(getattr(record, "created", time.time()))
+        with self._lock:
+            if self._last_key == key and (now - self._last_ts) < self._window:
+                return False
+            self._last_key = key
+            self._last_ts = now
+        return True
+
+
 LOGGER = logging.getLogger(__name__)
-LOGGER.propagate = False
+_has_dup_filter = any(isinstance(flt, _RecentDuplicateFilter) for flt in LOGGER.filters)
+if not _has_dup_filter:
+    LOGGER.addFilter(_RecentDuplicateFilter())
 
 
 def _describe_current_thread() -> str:
