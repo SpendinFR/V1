@@ -1437,6 +1437,13 @@ class CognitiveArchitecture:
             output_payload["diagnostics_text"] = diagnostics_text
 
         self._tick_background_systems()
+        try:
+            event_payload: Dict[str, Any] = {"reply": user_reply}
+            if user_msg:
+                event_payload["user_msg"] = user_msg
+            self._notify_scheduler("user_cycle", event_payload)
+        except Exception:
+            pass
         return output_payload
 
     def _handle_abduction_request(self, user_msg: str) -> Dict[str, Any]:
@@ -2122,17 +2129,29 @@ class CognitiveArchitecture:
             pass
 
     def _tick_background_systems(self) -> None:
+        job_events = 0
         try:
             if getattr(self, "jobs", None):
-                self.jobs.drain_to_memory(self.memory)
+                job_events = self.jobs.drain_to_memory(self.memory)
         except Exception:
-            pass
+            job_events = 0
+        if job_events:
+            try:
+                self._notify_scheduler("job_event", {"count": int(job_events)})
+            except Exception:
+                pass
 
+        inbox_added: List[str] = []
         try:
             if self.perception_interface:
-                self.perception_interface.step()
+                inbox_added = self.perception_interface.step()
         except Exception:
-            pass
+            inbox_added = []
+        if inbox_added:
+            try:
+                self._notify_scheduler("inbox_update", {"files": list(inbox_added)})
+            except Exception:
+                pass
 
         try:
             if self.emotions and hasattr(self.emotions, "step"):
@@ -2178,6 +2197,15 @@ class CognitiveArchitecture:
                         "assistant_msg": self.last_output_text,
                     },
                 )
+        except Exception:
+            pass
+
+    def _notify_scheduler(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        scheduler = getattr(self, "scheduler", None)
+        if not scheduler or not hasattr(scheduler, "notify"):
+            return
+        try:
+            scheduler.notify(event, payload=payload)
         except Exception:
             pass
 

@@ -25,7 +25,8 @@ import random
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
+from collections import deque
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
@@ -272,6 +273,7 @@ class Scheduler:
         self.state.setdefault("policies", {})
         self.state.setdefault("models", {})
         self.state["models"].setdefault("reflection", {})
+        self.state.setdefault("last_events", {})
         self.running = False
         self.thread = None
 
@@ -279,6 +281,8 @@ class Scheduler:
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self._policies: Dict[str, AdaptiveTaskPolicy] = {}
         self._pending_reflection_update: Optional[Dict[str, Any]] = None
+        self._event_queue: Deque[Tuple[str, Dict[str, Any]]] = deque()
+        self._condition = threading.Condition()
 
         reflection_state = self.state["models"].get("reflection", {})
         self._reflection_model = OnlineLogistic(
@@ -345,7 +349,13 @@ class Scheduler:
         except Exception:
             self._tick_counter = self._tick
 
-    # ---------- helpers ----------
+        # Émet un premier événement pour exécuter les tâches critiques au démarrage
+        try:
+            self.notify("boot", {"reason": "startup"})
+        except Exception:
+            pass
+
+        # ---------- helpers ----------
     def _build_state_snapshot(self) -> Dict[str, Any]:
         arch = self.arch
         language = getattr(arch, "language", None)
@@ -470,26 +480,83 @@ class Scheduler:
         self._policies[name] = policy
         return policy
 
-    def register(self, name: str, fn: Callable[[], None], interval_s: float, jitter_s: float = 0.0):
+    def register(
+        self,
+        name: str,
+        fn: Callable[[], None],
+        interval_s: float,
+        jitter_s: float = 0.0,
+        *,
+        triggers: Optional[Sequence[str]] = None,
+        predicate: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+    ):
         policy = self._init_policy(name, float(interval_s))
+        trigger_set = None
+        if triggers:
+            trigger_set = {str(event).strip() for event in triggers if str(event).strip()}
         self.tasks[name] = {
             "fn": fn,
             "interval": policy.current_interval,
             "jitter": float(jitter_s),
             "policy": policy,
             "base_interval": float(interval_s),
+            "triggers": trigger_set,
+            "predicate": predicate,
         }
         self.state["policies"][name] = policy.to_state()
 
     def _register_default_tasks(self):
         # Les fonctions sont toutes robustifiées (attr checks)
-        self.register("homeostasis", self._task_homeostasis, interval_s=60.0, jitter_s=5.0)
-        self.register("consolidation", self._task_consolidation, interval_s=180.0, jitter_s=10.0)
-        self.register("concepts", self._task_concepts, interval_s=45.0, jitter_s=5.0)
-        self.register("episodes", self._task_episodes, interval_s=60.0, jitter_s=5.0)
-        self.register("planning", self._task_planning, interval_s=90.0, jitter_s=8.0)
-        self.register("reflection", self._task_reflection, interval_s=120.0, jitter_s=10.0)
-        self.register("evolution", self._task_evolution, interval_s=120.0, jitter_s=10.0)
+        common_boot = ("boot",)
+        self.register(
+            "homeostasis",
+            self._task_homeostasis,
+            interval_s=60.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("user_cycle", "inbox_update", "action_completed", "job_event"),
+        )
+        self.register(
+            "consolidation",
+            self._task_consolidation,
+            interval_s=180.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("inbox_update", "action_completed", "job_event"),
+        )
+        self.register(
+            "concepts",
+            self._task_concepts,
+            interval_s=45.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("inbox_update", "user_cycle"),
+        )
+        self.register(
+            "episodes",
+            self._task_episodes,
+            interval_s=60.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("user_cycle", "action_completed"),
+        )
+        self.register(
+            "planning",
+            self._task_planning,
+            interval_s=90.0,
+            jitter_s=8.0,
+            triggers=common_boot + ("user_cycle", "action_completed"),
+        )
+        self.register(
+            "reflection",
+            self._task_reflection,
+            interval_s=120.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("action_completed", "job_event"),
+        )
+        self.register(
+            "evolution",
+            self._task_evolution,
+            interval_s=120.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("user_cycle", "job_event"),
+        )
 
     # ---------- adaptation helpers ----------
     def _scalarize_metrics(self, metrics: Dict[str, Any]) -> float:
@@ -616,6 +683,134 @@ class Scheduler:
             policy.current_interval = min(policy.base_interval * 3.0, policy.current_interval * 1.2)
         policy.llm_last = dict(response)  # type: ignore[attr-defined]
 
+    def notify(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        event_name = str(event).strip()
+        if not event_name:
+            return
+        event_payload = dict(payload or {})
+        with self._condition:
+            self._event_queue.append((event_name, event_payload))
+            self._condition.notify_all()
+
+    def _wait_for_event(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        with self._condition:
+            while (
+                self.running
+                and self.state.get("enabled", True)
+                and not self._event_queue
+            ):
+                self._condition.wait(timeout=1.0)
+            if not self.running or not self.state.get("enabled", True):
+                return None
+            return self._event_queue.popleft()
+
+    def _should_run_for_event(self, cfg: Dict[str, Any], event: str, payload: Dict[str, Any]) -> bool:
+        predicate = cfg.get("predicate")
+        if callable(predicate):
+            try:
+                return bool(predicate(event, payload))
+            except Exception:
+                return False
+        triggers: Optional[Set[str]] = cfg.get("triggers")
+        if triggers:
+            return event in triggers
+        return True
+
+    def _schedule_delayed_event(self, event: str, payload: Dict[str, Any], delay: float) -> None:
+        try:
+            delay_val = max(0.05, float(delay))
+        except Exception:
+            delay_val = 0.1
+
+        payload_copy = dict(payload)
+
+        def _emit_later() -> None:
+            with self._condition:
+                self._event_queue.append((event, payload_copy))
+                self._condition.notify_all()
+
+        timer = threading.Timer(delay_val, _emit_later)
+        timer.daemon = True
+        timer.start()
+
+    def _run_task(
+        self,
+        name: str,
+        cfg: Dict[str, Any],
+        *,
+        event: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        policy = cfg.get("policy")
+        interval = cfg.get("interval", 0.0)
+        if policy is not None:
+            interval = policy.current_interval
+
+        jitter = float(cfg.get("jitter", 0.0))
+        if jitter > 0:
+            time.sleep(min(jitter, 0.25))
+
+        t0 = _now()
+        ok = True
+        err = None
+        try:
+            cfg["fn"]()
+        except Exception as e:
+            ok = False
+            err = f"{e}\n{traceback.format_exc()}"
+        t1 = _now()
+
+        self.state["last_runs"][name] = t1
+        duration = t1 - t0
+        if policy is not None:
+            self._update_task_policy(name, policy, ok, duration)
+            cfg["interval"] = policy.current_interval
+            self.state["policies"][name] = policy.to_state()
+        sanitized_payload = json_sanitize(payload)
+        self.state.setdefault("last_events", {})[name] = {
+            "event": event,
+            "payload": sanitized_payload,
+            "ts": t1,
+        }
+        _write_json(self.paths["state"], self.state)
+        _append_jsonl(
+            self.paths["log"],
+            {
+                "t0": t0,
+                "t1": t1,
+                "dt": duration,
+                "task": name,
+                "ok": ok,
+                "err": err,
+                "interval": interval,
+                "next_interval": cfg.get("interval"),
+                "event": event,
+                "event_payload": sanitized_payload,
+            },
+        )
+
+    def _process_event(self, event: str, payload: Dict[str, Any]) -> None:
+        now = _now()
+        rerun_after: Optional[float] = None
+        for name, cfg in self.tasks.items():
+            if not self._should_run_for_event(cfg, event, payload):
+                continue
+            last = float(self.state["last_runs"].get(name, 0.0))
+            policy = cfg.get("policy")
+            interval = cfg.get("interval", 0.0)
+            if policy is not None:
+                interval = policy.current_interval
+            elapsed = now - last
+            if interval > 0.0 and elapsed < interval:
+                remaining = interval - elapsed
+                if rerun_after is None or remaining < rerun_after:
+                    rerun_after = remaining
+                continue
+            self._run_task(name, cfg, event=event, payload=payload)
+
+        if rerun_after is not None:
+            self._schedule_delayed_event(event, payload, rerun_after)
+
     # ---------- run loop ----------
     def start(self):
         if self.running:
@@ -626,51 +821,21 @@ class Scheduler:
 
     def stop(self):
         self.running = False
+        with self._condition:
+            self._condition.notify_all()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
     def _loop(self):
         while self.running and self.state.get("enabled", True):
+            event_payload = self._wait_for_event()
+            if event_payload is None:
+                break
+            event, payload = event_payload
             if self._should_pause_for_urgent_chain():
+                self._schedule_delayed_event(event, payload, 0.3)
                 continue
-            now = _now()
-            for name, cfg in self.tasks.items():
-                last = float(self.state["last_runs"].get(name, 0.0))
-                policy = cfg.get("policy")
-                interval = cfg.get("interval", 0.0)
-                if policy is not None:
-                    interval = policy.current_interval
-                due = last + interval
-                if now >= due:
-                    # jitter léger
-                    j = cfg["jitter"]
-                    if j > 0:
-                        time.sleep(min(j, 0.25))  # lissé
-
-                    t0 = _now()
-                    ok = True
-                    err = None
-                    try:
-                        cfg["fn"]()
-                    except Exception as e:
-                        ok = False
-                        err = f"{e}\n{traceback.format_exc()}"
-                    t1 = _now()
-
-                    self.state["last_runs"][name] = t1
-                    duration = t1 - t0
-                    if policy is not None:
-                        self._update_task_policy(name, policy, ok, duration)
-                        cfg["interval"] = policy.current_interval
-                    if policy is not None:
-                        self.state["policies"][name] = policy.to_state()
-                    _write_json(self.paths["state"], self.state)
-                    _append_jsonl(self.paths["log"], {
-                        "t0": t0, "t1": t1, "dt": duration, "task": name, "ok": ok, "err": err,
-                        "interval": interval,
-                        "next_interval": cfg.get("interval"),
-                    })
-            time.sleep(0.5)
+            self._process_event(event, payload)
 
     # ---------- coordination with job manager ----------
     def _resolve_job_manager(self) -> Optional["JobManager"]:
