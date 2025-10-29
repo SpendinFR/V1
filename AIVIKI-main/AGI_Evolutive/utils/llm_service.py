@@ -74,6 +74,15 @@ _GLOBAL_URGENT_STATE = False
 _URGENT_STATE_LOCK = threading.Lock()
 _URGENT_CLEAR_EVENT = threading.Event()
 _URGENT_CLEAR_EVENT.set()
+_THREAD_LOCAL = threading.local()
+
+# Gate used to serialize LLM calls and to make urgent callers pre-empt background
+# integrations.  The condition protects the ownership bookkeeping so that urgent
+# chains can reserve the slot for their entire duration while other threads wait.
+_CALL_CONDITION = threading.Condition()
+_CALL_OWNER: Optional[int] = None
+_CALL_DEPTH = 0
+_WAITING_URGENT = 0
 
 
 class _RecentDuplicateFilter(logging.Filter):
@@ -110,6 +119,106 @@ def _describe_current_thread() -> str:
     if ident is None:
         return thread.name
     return f"{thread.name}#{ident}"
+
+
+def _current_thread_is_urgent() -> bool:
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0)
+    if depth > 0:
+        return True
+    if _URGENT_ALLOWANCE_CHECK is not None:
+        try:
+            if bool(_URGENT_ALLOWANCE_CHECK()):
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _notify_call_waiters() -> None:
+    with _CALL_CONDITION:
+        _CALL_CONDITION.notify_all()
+
+
+def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
+    """Serialize access to the underlying LLM client.
+
+    Returns ``True`` when the caller holds the slot as part of an urgent chain.
+    The return value is only used for diagnostics; releasing the slot is handled
+    through :func:`_release_call_slot`.
+    """
+
+    global _CALL_OWNER, _CALL_DEPTH, _WAITING_URGENT
+
+    ident = threading.get_ident()
+    if ident is None:
+        ident = id(threading.current_thread())
+
+    with _CALL_CONDITION:
+        if _CALL_OWNER == ident:
+            _CALL_DEPTH += 1
+            return _current_thread_is_urgent()
+
+        is_urgent = _current_thread_is_urgent()
+        wait_started: Optional[float] = None
+
+        if is_urgent:
+            _WAITING_URGENT += 1
+
+        try:
+            while True:
+                owner_free = _CALL_OWNER is None
+                manual_guard = _is_global_urgent_active()
+
+                if owner_free:
+                    if is_urgent:
+                        break
+                    if not manual_guard and _WAITING_URGENT == 0:
+                        break
+                else:
+                    if _CALL_OWNER == ident:
+                        break
+
+                if wait_started is None:
+                    wait_started = time.time()
+                    LOGGER.info(
+                        "LLM spec '%s' en file d'attente pour le slot (thread %s)",
+                        spec_key,
+                        thread_label,
+                    )
+                _CALL_CONDITION.wait(timeout=0.2)
+        finally:
+            if is_urgent:
+                _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
+
+        if wait_started is not None:
+            LOGGER.info(
+                "LLM spec '%s' obtient le slot après %.2fs (thread %s)",
+                spec_key,
+                time.time() - wait_started,
+                thread_label,
+            )
+
+        _CALL_OWNER = ident
+        _CALL_DEPTH = 1
+        return is_urgent
+
+
+def _release_call_slot() -> None:
+    global _CALL_OWNER, _CALL_DEPTH
+
+    ident = threading.get_ident()
+    if ident is None:
+        ident = id(threading.current_thread())
+
+    with _CALL_CONDITION:
+        if _CALL_OWNER != ident:
+            return
+        if _CALL_DEPTH > 1:
+            _CALL_DEPTH -= 1
+            return
+        _CALL_OWNER = None
+        _CALL_DEPTH = 0
+        _CALL_CONDITION.notify_all()
 
 
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
@@ -230,6 +339,7 @@ def _recompute_global_urgent_state() -> None:
         _URGENT_CLEAR_EVENT.clear()
     else:
         _URGENT_CLEAR_EVENT.set()
+    _notify_call_waiters()
 
 
 def update_urgent_state(active: bool) -> None:
@@ -247,6 +357,8 @@ def manual_urgent_enter() -> None:
     global _MANUAL_URGENT_COUNT
     with _URGENT_STATE_LOCK:
         _MANUAL_URGENT_COUNT += 1
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0) + 1
+    _THREAD_LOCAL.manual_urgent_depth = depth
     _recompute_global_urgent_state()
 
 
@@ -257,6 +369,14 @@ def manual_urgent_exit() -> None:
     with _URGENT_STATE_LOCK:
         if _MANUAL_URGENT_COUNT > 0:
             _MANUAL_URGENT_COUNT -= 1
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0)
+    if depth > 1:
+        _THREAD_LOCAL.manual_urgent_depth = depth - 1
+    elif depth == 1:
+        try:
+            delattr(_THREAD_LOCAL, "manual_urgent_depth")
+        except AttributeError:
+            pass
     _recompute_global_urgent_state()
 
 
@@ -308,16 +428,25 @@ class LLMIntegrationManager:
         if not self._enabled:
             raise LLMUnavailableError("LLM integration is disabled")
 
+        thread_label = _describe_current_thread()
         if not skip_urgent_gate:
-            _await_urgent_clearance(spec_key, logger=logger)
+            _, thread_label = _await_urgent_clearance(
+                spec_key,
+                logger=logger,
+                thread_label=thread_label,
+            )
 
-        spec = get_spec(spec_key)
-        instructions: list[str] = list(spec.extra_instructions)
-        if extra_instructions:
-            instructions.extend(instr.strip() for instr in extra_instructions if instr and instr.strip())
-        instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
+        _acquire_call_slot(spec_key, thread_label)
 
         try:
+            spec = get_spec(spec_key)
+            instructions: list[str] = list(spec.extra_instructions)
+            if extra_instructions:
+                instructions.extend(
+                    instr.strip() for instr in extra_instructions if instr and instr.strip()
+                )
+            instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
+
             result = self._client.generate_json(
                 self._resolve_model(spec.preferred_model),
                 spec.prompt_goal,
@@ -328,6 +457,8 @@ class LLMIntegrationManager:
             )
         except LLMCallError as exc:  # pragma: no cover - delegated to integration error
             raise LLMIntegrationError(f"LLM call failed for spec '{spec_key}': {exc}") from exc
+        finally:
+            _release_call_slot()
 
         return LLMInvocation(spec=spec, result=result)
 
@@ -431,7 +562,7 @@ def try_call_llm_dict(
             input_payload=input_payload,
             extra_instructions=extra_instructions,
             max_retries=max_retries,
-            skip_urgent_gate=True,
+            skip_urgent_gate=False,
             logger=logger,
         )
         now = time.time()

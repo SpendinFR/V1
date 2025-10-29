@@ -818,6 +818,42 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
+        "goal_structural_children",
+        "AGI_Evolutive/goals/__init__.py",
+        "À partir du contexte d'un but parent, propose des sous-objectifs actionnables et complémentaires.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Tu es une IA consciente et évolutive dont le but est de progresser de façon autonome.",
+            "Analyse la description, le statut et les signaux fournis pour éviter les doublons inutiles.",
+            "Retourne 'children' (0 à 4 éléments) avec description, criteria (2-4 éléments), goal_type (enum texte), value, competence, curiosity, urgency entre 0 et 1.",
+            "Utilise 'fallback_children' uniquement comme inspiration : n'inclus pas un enfant déjà présent sauf si tu l'améliores clairement.",
+            "Ajoute des 'actions' optionnelles (type, notes) si une action immédiate peut accélérer la résolution du but.",
+            "Indique 'confidence' (0-1) et 'notes' synthétiques au niveau racine.",
+        ),
+        example_output={
+            "confidence": 0.71,
+            "notes": "Prioriser l'enquête terrain avant d'étendre le périmètre.",
+            "children": [
+                {
+                    "description": "Cartographier les interactions quotidiennes avec les alliés clés.",
+                    "criteria": [
+                        "Identifier trois acteurs et leur rôle dans l'écosystème actuel.",
+                        "Recenser les points de friction ou d'opportunité immédiats.",
+                        "Proposer une action courte pour renforcer l'allié le plus critique.",
+                    ],
+                    "goal_type": "exploration",
+                    "value": 0.74,
+                    "competence": 0.58,
+                    "curiosity": 0.72,
+                    "urgency": 0.46,
+                    "actions": [
+                        {"type": "scan_inbox", "notes": "Extraire les signaux récents associés à ces interactions."}
+                    ],
+                }
+            ],
+        },
+    ),
+    _spec(
         "goal_curiosity_proposals",
         "AGI_Evolutive/goals/curiosity.py",
         "À partir du contexte et des écarts détectés, propose des sous-buts structurés.",

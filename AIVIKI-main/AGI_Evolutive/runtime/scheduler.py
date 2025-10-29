@@ -17,6 +17,7 @@ though the file passed static syntax checks.  Restoring the missing imports
 and using the fully qualified package path fixes the scheduler logic.
 """
 
+import heapq
 import json
 import logging
 import math
@@ -283,6 +284,9 @@ class Scheduler:
         self._pending_reflection_update: Optional[Dict[str, Any]] = None
         self._event_queue: Deque[Tuple[str, Dict[str, Any]]] = deque()
         self._condition = threading.Condition()
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._schedule: List[Tuple[float, str]] = []
 
         reflection_state = self.state["models"].get("reflection", {})
         self._reflection_model = OnlineLogistic(
@@ -304,6 +308,7 @@ class Scheduler:
 
         self.workspace = getattr(self.arch, "global_workspace", None)
         self._urgent_pause_logged = False
+        self._job_manager_warning_emitted = False
 
         policy = getattr(self.arch, "policy", None)
         mechanism_store = None
@@ -317,7 +322,7 @@ class Scheduler:
                 try:
                     policy._mechanisms = mechanism_store
                 except Exception:
-                    pass
+                    self._log_exception("policy._mechanisms attachment")
         setattr(self.arch, "mechanism_store", mechanism_store)
         self.mechanism_store = mechanism_store
 
@@ -356,6 +361,11 @@ class Scheduler:
             pass
 
         # ---------- helpers ----------
+    def _log_exception(self, context: str) -> None:
+        """Centralized logging for unexpected scheduler errors."""
+        logger.exception("Scheduler error during %s", context)
+
+    # ---------- helpers ----------
     def _build_state_snapshot(self) -> Dict[str, Any]:
         arch = self.arch
         language = getattr(arch, "language", None)
@@ -380,7 +390,7 @@ class Scheduler:
                 if isinstance(registry, dict):
                     return registry
             except Exception:
-                pass
+                self._log_exception("policy.build_predicate_registry")
 
         dialogue = state.get("dialogue")
         world = state.get("world")
@@ -397,6 +407,7 @@ class Scheduler:
                         if fn(topic):
                             return True
                     except Exception:
+                        self._log_exception(f"belief accessor {accessor}")
                         continue
             return False
 
@@ -409,6 +420,7 @@ class Scheduler:
             try:
                 return float(confidence_for(topic)) >= float(threshold)
             except Exception:
+                self._log_exception("belief confidence lookup")
                 return False
 
         registry: Dict[str, Callable[..., bool]] = {
@@ -459,6 +471,7 @@ class Scheduler:
                     }
                     text = renderer.render_reply(semantics, ctx)
                 except Exception:
+                    self._log_exception("language.renderer.render_reply")
                     text = decision.get("decision_text") or text
         arch.last_output_text = text
         logger = getattr(arch, "logger", None)
@@ -466,7 +479,7 @@ class Scheduler:
             try:
                 logger.write("gw.decision", decision=decision, rendered=text)
             except Exception:
-                pass
+                self._log_exception("arch.logger.write gw.decision")
 
     # ---------- registration ----------
     def _init_policy(self, name: str, interval_s: float) -> AdaptiveTaskPolicy:
@@ -504,6 +517,16 @@ class Scheduler:
             "predicate": predicate,
         }
         self.state["policies"][name] = policy.to_state()
+        last_run = float(self.state["last_runs"].get(name, 0.0))
+        now = _now()
+        interval = policy.current_interval or float(interval_s)
+        due = max(now, last_run + interval)
+        jitter = float(jitter_s)
+        if jitter > 0.0:
+            due += random.uniform(0.0, jitter)
+        with self._cond:
+            heapq.heappush(self._schedule, (due, name))
+            self._cond.notify_all()
 
     def _register_default_tasks(self):
         # Les fonctions sont toutes robustifiées (attr checks)
@@ -644,7 +667,7 @@ class Scheduler:
             self._reflection_model.update(features, label)
             self._reflection_calibrator.update(raw_prob, label)
         except Exception:
-            pass
+            self._log_exception("reflection model update")
         self.state["models"]["reflection"] = {
             "logistic": self._reflection_model.to_state(),
             "calibrator": self._reflection_calibrator.to_state(),
@@ -815,6 +838,7 @@ class Scheduler:
     def start(self):
         if self.running:
             return
+        self._rebuild_schedule()
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -837,55 +861,52 @@ class Scheduler:
                 continue
             self._process_event(event, payload)
 
-    # ---------- coordination with job manager ----------
     def _resolve_job_manager(self) -> Optional["JobManager"]:
-        jm = getattr(self.arch, "jobs", None)
+        jm = getattr(self.arch, "job_manager", None)
         if jm is None:
-            jm = getattr(self.arch, "job_manager", None)
-        return jm if jm is not None else None
+            if not self._job_manager_warning_emitted:
+                logger.warning("Scheduler running without job_manager interface")
+                self._job_manager_warning_emitted = True
+            return None
+
+        missing = [name for name in ("is_urgent_active", "wait_until_cleared") if not callable(getattr(jm, name, None))]
+        if missing:
+            if not self._job_manager_warning_emitted:
+                logger.error(
+                    "JobManager missing required methods: %s", ", ".join(missing)
+                )
+                self._job_manager_warning_emitted = True
+            return None
+
+        self._job_manager_warning_emitted = False
+        return jm
 
     def _should_pause_for_urgent_chain(self) -> bool:
         jm = self._resolve_job_manager()
         if not jm:
             if self._urgent_pause_logged:
-                try:
-                    logger.info("Scheduler resume: urgent chain cleared")
-                except Exception:
-                    pass
+                logger.info("Scheduler resume: urgent chain cleared")
                 self._urgent_pause_logged = False
             return False
 
-        paused = False
-        used_wait_api = False
-        if hasattr(jm, "pause_if_urgent_active"):
-            try:
-                paused = bool(jm.pause_if_urgent_active(timeout=0.2))
-                used_wait_api = True
-            except Exception:
-                paused = False
-                used_wait_api = False
-        if not used_wait_api and hasattr(jm, "has_active_urgent_chain"):
-            try:
-                paused = bool(jm.has_active_urgent_chain())
-            except Exception:
-                paused = False
-            if paused:
-                time.sleep(0.2)
+        try:
+            active = bool(jm.is_urgent_active())
+        except Exception:
+            logger.exception("JobManager.is_urgent_active failed")
+            active = False
 
-        if paused:
+        if active:
             if not self._urgent_pause_logged:
-                try:
-                    logger.info("Scheduler pause: urgent job chain active")
-                except Exception:
-                    pass
+                logger.info("Scheduler pause: urgent job chain active")
                 self._urgent_pause_logged = True
+            try:
+                jm.wait_until_cleared(timeout=0.5)
+            except Exception:
+                logger.exception("JobManager.wait_until_cleared failed")
             return True
 
         if self._urgent_pause_logged:
-            try:
-                logger.info("Scheduler resume: urgent chain cleared")
-            except Exception:
-                pass
+            logger.info("Scheduler resume: urgent chain cleared")
             self._urgent_pause_logged = False
         return False
 
@@ -901,7 +922,7 @@ class Scheduler:
             try:
                 emo.adjust_if_needed()
             except Exception:
-                pass
+                self._log_exception("emotions.adjust_if_needed")
 
     def _task_consolidation(self):
         # mémoire/learning : consolidation (si dispo)
@@ -914,21 +935,21 @@ class Scheduler:
                 learn.consolidate()
                 return
             except Exception:
-                pass
+                self._log_exception("learning.consolidate")
         # memory
         if mem and hasattr(mem, "consolidate"):
             try:
                 mem.consolidate()
                 return
             except Exception:
-                pass
+                self._log_exception("memory.consolidate")
         # consolidator (style VIKI+)
         cons = getattr(self.arch, "consolidator", None)
         if cons and hasattr(cons, "run_once_now"):
             try:
                 cons.run_once_now(scope="auto")
             except Exception:
-                pass
+                self._log_exception("consolidator.run_once_now")
 
     def _task_concepts(self):
         ce = getattr(self.arch, "concept_extractor", None)
@@ -947,6 +968,7 @@ class Scheduler:
         try:
             applicable = list(self.mechanism_store.scan_applicable(state, predicate_registry))
         except Exception:
+            self._log_exception("mechanism_store.scan_applicable")
             applicable = []
         self._last_applicable_mais = applicable
 
@@ -957,6 +979,7 @@ class Scheduler:
             try:
                 bids = list(mechanism.propose(state))
             except Exception:
+                self._log_exception(f"mechanism.propose {getattr(mechanism, 'id', 'unknown')}")
                 continue
             for bid in bids:
                 try:
@@ -978,12 +1001,12 @@ class Scheduler:
                 goals.step()
                 return
             except Exception:
-                pass
+                self._log_exception("goals.step")
         if goals and hasattr(goals, "refresh_plans"):
             try:
                 goals.refresh_plans()
             except Exception:
-                pass
+                self._log_exception("goals.refresh_plans")
         workspace = self._get_workspace()
         policy = getattr(self.arch, "policy", None)
         if workspace and policy and hasattr(workspace, "step") and hasattr(policy, "decide_with_bids"):
@@ -992,11 +1015,13 @@ class Scheduler:
                 workspace.step(state, timebox_iters=2)
                 winners = list(workspace.winners())
             except Exception:
+                self._log_exception("workspace.step")
                 winners = []
             if not winners:
                 try:
                     winners = list(workspace.last_trace())
                 except Exception:
+                    self._log_exception("workspace.last_trace")
                     winners = []
             try:
                 decision = policy.decide_with_bids(
@@ -1009,6 +1034,7 @@ class Scheduler:
                     ctx={"scheduler": True, "workspace_trace": [bid.origin_tag() for bid in winners]},
                 )
             except Exception:
+                self._log_exception("policy.decide_with_bids")
                 decision = None
 
             if decision:
@@ -1026,6 +1052,7 @@ class Scheduler:
                         runtime.emit(utterance)
                         emitted = True
                     except Exception:
+                        self._log_exception("response_api.format_agent_reply/runtime.emit")
                         emitted = False
                 if not emitted:
                     self._render_and_emit(decision, state)
@@ -1042,6 +1069,7 @@ class Scheduler:
                             try:
                                 outcome = critic.last_outcome() or {}
                             except Exception:
+                                self._log_exception("SocialCritic.last_outcome")
                                 outcome = {}
                         if outcome:
                             self._last_planning_outcome = outcome
@@ -1061,11 +1089,12 @@ class Scheduler:
                                 try:
                                     self.mechanism_store.update(mechanism)
                                 except Exception:
-                                    pass
+                                    self._log_exception("mechanism_store.update")
                             except Exception:
+                                self._log_exception(f"mechanism feedback update {getattr(mechanism, 'id', 'unknown')}")
                                 continue
                     except Exception:
-                        pass
+                        self._log_exception("SocialCritic evaluation")
                 # If no social evaluation is available we keep the pending
                 # reflection update until feedback arrives, avoiding neutral
                 # training data that would collapse the model.
@@ -1091,8 +1120,8 @@ class Scheduler:
                 depth=depth
             )
         except Exception:
+            self._log_exception("metacognition.trigger_reflection")
             self._pending_reflection_update = None
-            pass
 
     def _task_evolution(self):
         evo = getattr(self.arch, "evolution", None)
@@ -1103,7 +1132,7 @@ class Scheduler:
                 # potentiellement proposer des évolutions (non destructif)
                 evo.propose_evolution()
             except Exception:
-                pass
+                self._log_exception("evolution.record_cycle/propose_evolution")
         self._tick = getattr(self, "_tick", 0) + 1
         self._tick_counter = self._tick
         if self._tick % self._evolution_period == 0:
@@ -1120,6 +1149,7 @@ class Scheduler:
                     try:
                         recent_docs = memory.get_recent_memories(n=200)
                     except Exception:
+                        self._log_exception("memory.get_recent_memories")
                         recent_docs = []
 
             if hasattr(arch, "recent_dialogues"):
@@ -1132,6 +1162,7 @@ class Scheduler:
                     try:
                         recent_dialogues = dialogue_log.get_recent(100)
                     except Exception:
+                        self._log_exception("dialogue_log.get_recent")
                         recent_dialogues = []
 
             metrics_snapshot: Dict[str, Any] = {}
@@ -1140,6 +1171,7 @@ class Scheduler:
                 try:
                     metrics_snapshot = metrics.snapshot() or {}
                 except Exception:
+                    self._log_exception("metrics.snapshot")
                     metrics_snapshot = {}
             self._last_metrics_snapshot = metrics_snapshot or {}
             new_value = self._scalarize_metrics(self._last_metrics_snapshot)
@@ -1154,4 +1186,4 @@ class Scheduler:
             try:
                 self.principle_inducer.run(recent_docs, recent_dialogues, metrics_snapshot)
             except Exception:
-                pass
+                self._log_exception("principle_inducer.run")
