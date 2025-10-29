@@ -757,11 +757,34 @@ class _PerceptionAdapter:
         self._iface = interface
         self._signals: List[Dict[str, Any]] = []
 
+    def _resolve_job_manager(self) -> Optional[Any]:
+        bound = getattr(self._iface, "bound", None)
+        jm = None
+        if isinstance(bound, dict):
+            jm = bound.get("jobs")
+        if jm is None:
+            arch = getattr(self._iface, "arch", None)
+            if arch is not None:
+                jm = getattr(arch, "job_manager", None) or getattr(arch, "jobs", None)
+        return jm
+
     def ingest_user_message(self, text: str, author: str = "user") -> None:
+        urgent_ctx: Optional[str] = None
+        jm = self._resolve_job_manager()
+        if jm and hasattr(jm, "activate_urgent_context"):
+            try:
+                urgent_ctx = jm.activate_urgent_context(["SIGNAL"])
+            except Exception:
+                urgent_ctx = None
         try:
             self._iface.ingest_user_message(text, speaker=author)
         except AttributeError:
             self._iface.ingest_user_utterance(text, author=author)  # type: ignore[attr-defined]
+
+        record = {"kind": "dialogue", "payload": {"text": text, "speaker": author}}
+        if urgent_ctx:
+            record["urgent_ctx"] = urgent_ctx
+        self._signals.append(record)
 
     def observe(self, trigger: Trigger) -> Dict[str, Any]:
         payload = trigger.payload or {}
@@ -1218,6 +1241,19 @@ class Orchestrator:
         except Exception:
             pass
         self._perception_interface = PerceptionInterface(self._memory_store)
+        try:
+            self._perception_interface.bind(
+                arch=self.arch,
+                memory=self._memory_store,
+                metacog=self._meta,
+                emotions=self._emotion_engine,
+                language=getattr(self.arch, "language", None),
+            )
+            bound = getattr(self._perception_interface, "bound", None)
+            if isinstance(bound, dict):
+                bound.setdefault("jobs", job_manager)
+        except Exception:
+            pass
         self.curiosity = CuriosityEngine(architecture=self.arch)
 
         self.scheduler = LightScheduler()
@@ -1947,19 +1983,19 @@ class Orchestrator:
         signals = self.io.perception.pop_signals(max_n=4)
         if not signals:
             return []
-        return [
-            Trigger(
-                TriggerType.SIGNAL,
-                {
-                    "source": "system",
-                    "importance": 0.5,
-                    "immediacy": 0.3,
-                    "effort": 0.2,
-                },
-                payload=s,
-            )
-            for s in signals
-        ]
+        triggers: List[Trigger] = []
+        for signal in signals:
+            payload = signal.get("payload") if isinstance(signal, dict) else signal
+            meta = {
+                "source": "system",
+                "importance": 0.5,
+                "immediacy": 0.3,
+                "effort": 0.2,
+            }
+            if isinstance(signal, dict) and signal.get("urgent_ctx"):
+                meta["urgent_ctx"] = signal["urgent_ctx"]
+            triggers.append(Trigger(TriggerType.SIGNAL, meta, payload=payload))
+        return triggers
 
     def _habit_collector(self) -> List[Trigger]:
         cue = self.cognition.habits.poll_context_cue()
@@ -3697,6 +3733,7 @@ class Orchestrator:
         job_manager = getattr(self, "job_manager", None)
         urgent_types = {TriggerType.SIGNAL, TriggerType.THREAT, TriggerType.NEED}
         trigger_meta = trigger.meta or {}
+        ingest_ctx = trigger_meta.pop("urgent_ctx", None)
         tokens: Set[str] = set()
         if trigger.type in urgent_types:
             tokens.add(trigger.type.name)
@@ -3707,6 +3744,9 @@ class Orchestrator:
                     token = item.strip().upper()
                     if token:
                         tokens.add(token)
+        source = str(trigger_meta.get("source", "")).strip().lower()
+        if source == "user":
+            tokens.add("SIGNAL")
         ctx_id: Optional[str] = None
         if job_manager and hasattr(job_manager, "activate_urgent_context"):
             try:
@@ -3719,6 +3759,11 @@ class Orchestrator:
             if job_manager and hasattr(job_manager, "deactivate_urgent_context"):
                 try:
                     job_manager.deactivate_urgent_context(ctx_id)
+                except Exception:
+                    pass
+            if ingest_ctx and job_manager and hasattr(job_manager, "deactivate_urgent_context"):
+                try:
+                    job_manager.deactivate_urgent_context(ingest_ctx)
                 except Exception:
                     pass
 
