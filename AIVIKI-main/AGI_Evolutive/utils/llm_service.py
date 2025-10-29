@@ -160,6 +160,7 @@ def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
 
         is_urgent = _current_thread_is_urgent()
         wait_started: Optional[float] = None
+        acquired = False
 
         if is_urgent:
             _WAITING_URGENT += 1
@@ -172,6 +173,8 @@ def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
                 if owner_free:
                     if is_urgent:
                         break
+                    # Bloque les appels de fond tant qu'une chaîne urgente est
+                    # active ou qu'un appel urgent attend déjà le slot.
                     if not manual_guard and _WAITING_URGENT == 0:
                         break
                 else:

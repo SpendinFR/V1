@@ -910,6 +910,58 @@ class Scheduler:
             self._urgent_pause_logged = False
         return False
 
+    # ---------- coordination with job manager ----------
+    def _resolve_job_manager(self) -> Optional["JobManager"]:
+        jm = getattr(self.arch, "jobs", None)
+        if jm is None:
+            jm = getattr(self.arch, "job_manager", None)
+        return jm if jm is not None else None
+
+    def _should_pause_for_urgent_chain(self) -> bool:
+        jm = self._resolve_job_manager()
+        if not jm:
+            if self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler resume: urgent chain cleared")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = False
+            return False
+
+        paused = False
+        used_wait_api = False
+        if hasattr(jm, "pause_if_urgent_active"):
+            try:
+                paused = bool(jm.pause_if_urgent_active(timeout=0.2))
+                used_wait_api = True
+            except Exception:
+                paused = False
+                used_wait_api = False
+        if not used_wait_api and hasattr(jm, "has_active_urgent_chain"):
+            try:
+                paused = bool(jm.has_active_urgent_chain())
+            except Exception:
+                paused = False
+            if paused:
+                time.sleep(0.2)
+
+        if paused:
+            if not self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler pause: urgent job chain active")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = True
+            return True
+
+        if self._urgent_pause_logged:
+            try:
+                logger.info("Scheduler resume: urgent chain cleared")
+            except Exception:
+                pass
+            self._urgent_pause_logged = False
+        return False
+
     # ---------- individual tasks (robustes) ----------
     def _task_homeostasis(self):
         # module emotions/homeostasis (si existant)
