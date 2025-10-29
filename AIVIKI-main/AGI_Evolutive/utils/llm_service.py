@@ -68,6 +68,8 @@ _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 _URGENT_ACTIVE_CHECK: Optional[Callable[[], bool]] = None
 _URGENT_ALLOWANCE_CHECK: Optional[Callable[[], bool]] = None
+_GLOBAL_URGENT_STATE = False
+_URGENT_STATE_LOCK = threading.Lock()
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +106,30 @@ def register_urgent_gate(
     global _URGENT_ACTIVE_CHECK, _URGENT_ALLOWANCE_CHECK
     _URGENT_ACTIVE_CHECK = check_active
     _URGENT_ALLOWANCE_CHECK = allow_current
+
+    # Synchronise the cached urgent flag with the currently registered source so
+    # that late registrations (or reconfigurations after a restart) immediately
+    # reflect any active urgent window.  This prevents a short race where
+    # background threads could observe ``False`` in the cache before the first
+    # explicit update emitted by the job manager.
+    if check_active is not None:
+        try:
+            update_urgent_state(bool(check_active()))
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+
+def update_urgent_state(active: bool) -> None:
+    """Cache the urgent flag so background threads can read it without RPC."""
+
+    global _GLOBAL_URGENT_STATE
+    with _URGENT_STATE_LOCK:
+        _GLOBAL_URGENT_STATE = bool(active)
+
+
+def _is_global_urgent_active() -> bool:
+    with _URGENT_STATE_LOCK:
+        return _GLOBAL_URGENT_STATE
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -251,8 +277,8 @@ def try_call_llm_dict(
 
     wait_started: Optional[float] = None
     while True:
-        active = False
-        if _URGENT_ACTIVE_CHECK is not None:
+        active = _is_global_urgent_active()
+        if not active and _URGENT_ACTIVE_CHECK is not None:
             try:
                 active = bool(_URGENT_ACTIVE_CHECK())
             except Exception:

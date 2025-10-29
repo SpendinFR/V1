@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Set, Iterable
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import try_call_llm_dict, update_urgent_state
 
 
 LOGGER = logging.getLogger(__name__)
@@ -231,6 +231,10 @@ class JobManager:
                 check_active=self.has_active_urgent_chain,
                 allow_current=self.current_thread_has_urgent_permission,
             )
+        except Exception:
+            pass
+        try:
+            update_urgent_state(False)
         except Exception:
             pass
 
@@ -779,6 +783,10 @@ class JobManager:
         if changed or active:
             # Toujours notifier les threads en attente pour réduire la latence.
             self._urgent_condition.notify_all()
+        try:
+            update_urgent_state(self._urgent_state)
+        except Exception:
+            pass
 
     def current_thread_has_urgent_permission(self) -> bool:
         urgent_types = {"SIGNAL", "THREAT", "NEED"}
