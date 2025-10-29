@@ -1,6 +1,7 @@
 """Service layer to orchestrate repository-wide LLM integrations."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -67,6 +68,16 @@ _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 _URGENT_ACTIVE_CHECK: Optional[Callable[[], bool]] = None
 _URGENT_ALLOWANCE_CHECK: Optional[Callable[[], bool]] = None
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _describe_current_thread() -> str:
+    thread = threading.current_thread()
+    ident = getattr(thread, "ident", None)
+    if ident is None:
+        return thread.name
+    return f"{thread.name}#{ident}"
 
 
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
@@ -226,7 +237,15 @@ def try_call_llm_dict(
     heuristics.
     """
 
+    thread_label = _describe_current_thread()
+    request_ts = time.time()
+
     if not is_llm_enabled():
+        LOGGER.info(
+            "LLM spec '%s' ignorée (LLM désactivé) – thread %s",
+            spec_key,
+            thread_label,
+        )
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         return None
 
@@ -250,6 +269,11 @@ def try_call_llm_dict(
             break
         if wait_started is None:
             wait_started = time.time()
+            LOGGER.info(
+                "LLM spec '%s' en attente : chaîne urgente active (thread %s)",
+                spec_key,
+                thread_label,
+            )
             if logger is not None:
                 try:
                     logger.debug(
@@ -267,7 +291,15 @@ def try_call_llm_dict(
             )
         except Exception:
             pass
+    if wait_started is not None:
+        LOGGER.info(
+            "LLM spec '%s' reprise après %.2fs (thread %s)",
+            spec_key,
+            time.time() - wait_started,
+            thread_label,
+        )
 
+    call_started_at = time.time()
     try:
         manager = get_llm_manager()
         payload = manager.call_dict(
@@ -276,9 +308,28 @@ def try_call_llm_dict(
             extra_instructions=extra_instructions,
             max_retries=max_retries,
         )
+        now = time.time()
+        total_duration = now - request_ts
+        call_duration = now - call_started_at
+        LOGGER.info(
+            "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+            spec_key,
+            total_duration,
+            call_duration,
+            thread_label,
+        )
         _record_activity(spec_key, "success", None)
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.warning(
+            "LLM spec '%s' indisponible après %.2fs – thread %s : %s",
+            spec_key,
+            total_duration,
+            thread_label,
+            exc,
+        )
         _record_activity(spec_key, "error", str(exc))
         if logger is not None:
             try:
@@ -289,6 +340,14 @@ def try_call_llm_dict(
                 pass
         return None
     except Exception as exc:  # pragma: no cover - unexpected failure safety net
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.exception(
+            "Erreur inattendue pour la spec LLM '%s' après %.2fs – thread %s",
+            spec_key,
+            total_duration,
+            thread_label,
+        )
         _record_activity(spec_key, "error", str(exc))
         if logger is not None:
             try:
