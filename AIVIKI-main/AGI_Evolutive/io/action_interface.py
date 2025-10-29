@@ -12,7 +12,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from AGI_Evolutive.autonomy.auto_signals import (
     AutoSignalRegistry,
@@ -465,6 +465,40 @@ class ActionInterface:
             base_context *= max(0.2, 1.0 - 0.5 * load)
         return max(0.0, min(1.0, base_context))
 
+    @staticmethod
+    def _collect_priority_tokens(context: Mapping[str, Any] | None) -> Set[str]:
+        tokens: Set[str] = set()
+        if not isinstance(context, Mapping):
+            return tokens
+        chain = context.get("priority_chain")
+        if isinstance(chain, (list, tuple, set)):
+            for item in chain:
+                if isinstance(item, str):
+                    token = item.strip().upper()
+                    if token:
+                        tokens.add(token)
+        trigger = context.get("trigger_type")
+        if isinstance(trigger, str):
+            token = trigger.strip().upper()
+            if token:
+                tokens.add(token)
+        source = context.get("source") or context.get("origin")
+        if isinstance(source, str):
+            token = source.strip().upper()
+            if token:
+                tokens.add(token)
+        return tokens
+
+    def _has_urgent_flag(self, act: Action) -> bool:
+        urgent_tokens = {"SIGNAL", "THREAT", "NEED"}
+        context_tokens = self._collect_priority_tokens(act.context)
+        if context_tokens.intersection(urgent_tokens):
+            return True
+        if act.meta:
+            meta_tokens = self._collect_priority_tokens(act.meta)
+            return bool(meta_tokens.intersection(urgent_tokens))
+        return False
+
     def _heuristic_action_score(
         self,
         candidate: Mapping[str, Any],
@@ -836,6 +870,10 @@ class ActionInterface:
 
         kind, lane, prio = spec
 
+        chain_tokens: Set[str] = set()
+        trigger_token: Optional[str] = None
+        source_token: Optional[str] = None
+
         # Closure sûre : exécuter le handler dans le worker
         def _runner(ctx, args):
             # Le handler retourne un dict ; on peut mettre à jour le progrès si besoin :
@@ -843,11 +881,86 @@ class ActionInterface:
             res = handler(act)  # handler lit self.bound[...] (thread-safe si tes sous-systèmes supportent la lecture)
             return res
 
+        job_meta = dict(act.meta or {})
+        if isinstance(act.context, dict):
+            chain = act.context.get("priority_chain")
+            if isinstance(chain, (list, tuple, set)):
+                job_meta.setdefault("priority_chain", list(chain))
+                for item in chain:
+                    if isinstance(item, str):
+                        token = item.strip().upper()
+                        if token:
+                            chain_tokens.add(token)
+            trigger_type = act.context.get("trigger_type")
+            if trigger_type and "trigger_type" not in job_meta:
+                job_meta["trigger_type"] = trigger_type
+            if isinstance(trigger_type, str):
+                trig = trigger_type.strip().upper()
+                if trig:
+                    trigger_token = trig
+                    chain_tokens.add(trig)
+            source = act.context.get("source") or act.context.get("origin")
+            if source and "source" not in job_meta:
+                job_meta["source"] = source
+            if isinstance(source, str):
+                src = source.strip().lower()
+                if src:
+                    source_token = src
+
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if trigger_token is None:
+            trig_meta = job_meta.get("trigger_type")
+            if isinstance(trig_meta, str):
+                token = trig_meta.strip().upper()
+                if token:
+                    trigger_token = token
+                    chain_tokens.add(token)
+        if not chain_tokens:
+            meta_chain = job_meta.get("priority_chain")
+            if isinstance(meta_chain, (list, tuple, set)):
+                for item in meta_chain:
+                    if isinstance(item, str):
+                        token = item.strip().upper()
+                        if token:
+                            chain_tokens.add(token)
+        if source_token is None:
+            src_meta = job_meta.get("source") or job_meta.get("origin")
+            if isinstance(src_meta, str):
+                token = src_meta.strip().lower()
+                if token:
+                    source_token = token
+
+        if chain_tokens:
+            existing_chain: List[str] = []
+            raw_chain = job_meta.get("priority_chain")
+            if isinstance(raw_chain, (list, tuple, set)):
+                for item in raw_chain:
+                    if isinstance(item, str):
+                        token = item.strip().upper()
+                        if token:
+                            existing_chain.append(token)
+            merged_chain: List[str] = []
+            seen_chain: Set[str] = set()
+            for token in existing_chain + sorted(chain_tokens):
+                if token and token not in seen_chain:
+                    merged_chain.append(token)
+                    seen_chain.add(token)
+            if merged_chain:
+                job_meta["priority_chain"] = merged_chain
+
+        urgent = (trigger_token in urgent_types) or bool(chain_tokens.intersection(urgent_types))
+        if urgent:
+            lane = "interactive"
+            prio = 1.0
+        elif source_token in {"user", "interaction"}:
+            lane = "interactive"
+            prio = max(prio, 0.9)
+
         key = f"{act.type}:{hash(json.dumps({'p': act.payload, 'c': act.context}, sort_keys=True))}"
         jid = jm.submit(
             kind=kind,
             fn=_runner,
-            args={},
+            args={"meta": job_meta},
             queue=lane,
             priority=prio,
             key=key,
@@ -878,7 +991,15 @@ class ActionInterface:
         if not self.queue:
             return
 
-        act = self.queue.pop(0)
+        urgent_index: Optional[int] = None
+        for idx, candidate in enumerate(self.queue):
+            if self._has_urgent_flag(candidate):
+                urgent_index = idx
+                break
+        if urgent_index is not None:
+            act = self.queue.pop(urgent_index)
+        else:
+            act = self.queue.pop(0)
         self._execute(act)
         time.sleep(self.cooldown_s)
 

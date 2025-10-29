@@ -25,13 +25,16 @@ import random
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
 from AGI_Evolutive.knowledge.mechanism_store import MechanismStore
 from AGI_Evolutive.cognition.principle_inducer import PrincipleInducer
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+
+if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+    from AGI_Evolutive.runtime.job_manager import JobManager
 
 
 logger = logging.getLogger(__name__)
@@ -296,6 +299,7 @@ class Scheduler:
         self._register_default_tasks()
 
         self.workspace = getattr(self.arch, "global_workspace", None)
+        self._urgent_pause_logged = False
 
         policy = getattr(self.arch, "policy", None)
         mechanism_store = None
@@ -627,6 +631,8 @@ class Scheduler:
 
     def _loop(self):
         while self.running and self.state.get("enabled", True):
+            if self._should_pause_for_urgent_chain():
+                continue
             now = _now()
             for name, cfg in self.tasks.items():
                 last = float(self.state["last_runs"].get(name, 0.0))
@@ -665,6 +671,58 @@ class Scheduler:
                         "next_interval": cfg.get("interval"),
                     })
             time.sleep(0.5)
+
+    # ---------- coordination with job manager ----------
+    def _resolve_job_manager(self) -> Optional["JobManager"]:
+        jm = getattr(self.arch, "jobs", None)
+        if jm is None:
+            jm = getattr(self.arch, "job_manager", None)
+        return jm if jm is not None else None
+
+    def _should_pause_for_urgent_chain(self) -> bool:
+        jm = self._resolve_job_manager()
+        if not jm:
+            if self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler resume: urgent chain cleared")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = False
+            return False
+
+        paused = False
+        used_wait_api = False
+        if hasattr(jm, "pause_if_urgent_active"):
+            try:
+                paused = bool(jm.pause_if_urgent_active(timeout=0.2))
+                used_wait_api = True
+            except Exception:
+                paused = False
+                used_wait_api = False
+        if not used_wait_api and hasattr(jm, "has_active_urgent_chain"):
+            try:
+                paused = bool(jm.has_active_urgent_chain())
+            except Exception:
+                paused = False
+            if paused:
+                time.sleep(0.2)
+
+        if paused:
+            if not self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler pause: urgent job chain active")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = True
+            return True
+
+        if self._urgent_pause_logged:
+            try:
+                logger.info("Scheduler resume: urgent chain cleared")
+            except Exception:
+                pass
+            self._urgent_pause_logged = False
+        return False
 
     # ---------- individual tasks (robustes) ----------
     def _task_homeostasis(self):

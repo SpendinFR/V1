@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 
 from itertools import islice
 
@@ -65,6 +65,9 @@ class LLMCallRecord:
 
 _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
+_URGENT_ACTIVE_CHECK: Optional[Callable[[], bool]] = None
+_URGENT_ALLOWANCE_CHECK: Optional[Callable[[], bool]] = None
+
 
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
@@ -78,6 +81,18 @@ def _record_activity(spec_key: str, status: str, message: Optional[str] = None) 
         )
     except Exception:  # pragma: no cover - defensive guard for diagnostics
         pass
+
+
+def register_urgent_gate(
+    *,
+    check_active: Optional[Callable[[], bool]] = None,
+    allow_current: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Register callables used to gate background LLM usage during urgent chains."""
+
+    global _URGENT_ACTIVE_CHECK, _URGENT_ALLOWANCE_CHECK
+    _URGENT_ACTIVE_CHECK = check_active
+    _URGENT_ALLOWANCE_CHECK = allow_current
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -215,6 +230,44 @@ def try_call_llm_dict(
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         return None
 
+    wait_started: Optional[float] = None
+    while True:
+        active = False
+        if _URGENT_ACTIVE_CHECK is not None:
+            try:
+                active = bool(_URGENT_ACTIVE_CHECK())
+            except Exception:
+                active = False
+        if not active:
+            break
+        allowed = False
+        if _URGENT_ALLOWANCE_CHECK is not None:
+            try:
+                allowed = bool(_URGENT_ALLOWANCE_CHECK())
+            except Exception:
+                allowed = False
+        if allowed:
+            break
+        if wait_started is None:
+            wait_started = time.time()
+            if logger is not None:
+                try:
+                    logger.debug(
+                        "LLM integration '%s' en attente : chaîne urgente active", spec_key
+                    )
+                except Exception:
+                    pass
+        time.sleep(0.2)
+    if wait_started is not None and logger is not None:
+        try:
+            logger.debug(
+                "LLM integration '%s' reprise après %.2fs d'attente urgente",
+                spec_key,
+                time.time() - wait_started,
+            )
+        except Exception:
+            pass
+
     try:
         manager = get_llm_manager()
         payload = manager.call_dict(
@@ -259,6 +312,7 @@ __all__ = [
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",
+    "register_urgent_gate",
     "set_llm_manager",
     "try_call_llm_dict",
 ]
