@@ -191,6 +191,22 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
+        "language_intent_detection",
+        "AGI_Evolutive/language/intent_detection.py",
+        "Identifie l'intention conversationnelle (salutation, présentation, question, etc.) à partir d'un message court.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'intent', 'confidence', 'canonical_utterance' et 'notes'.",
+            "Si l'intention est incertaine, mets 'intent' à 'unknown' et explique dans 'notes'.",
+        ),
+        example_output={
+            "intent": "greeting",
+            "confidence": 0.82,
+            "canonical_utterance": "bonjour",
+            "notes": "Message limité à une salutation sans informations supplémentaires.",
+        },
+    ),
+    _spec(
         "language_understanding",
         "AGI_Evolutive/language/understanding.py",
         "Analyse l'énoncé et remplis les slots de compréhension.",
