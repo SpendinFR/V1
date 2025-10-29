@@ -68,12 +68,15 @@ _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 _URGENT_ACTIVE_CHECK: Optional[Callable[[], bool]] = None
 _URGENT_ALLOWANCE_CHECK: Optional[Callable[[], bool]] = None
+_BASE_URGENT_STATE = False
+_MANUAL_URGENT_COUNT = 0
 _GLOBAL_URGENT_STATE = False
 _URGENT_STATE_LOCK = threading.Lock()
 _URGENT_CLEAR_EVENT = threading.Event()
 _URGENT_CLEAR_EVENT.set()
 
 LOGGER = logging.getLogger(__name__)
+LOGGER.propagate = False
 
 
 def _describe_current_thread() -> str:
@@ -193,17 +196,43 @@ def register_urgent_gate(
             pass
 
 
-def update_urgent_state(active: bool) -> None:
-    """Cache the urgent flag so background threads can read it without RPC."""
-
+def _recompute_global_urgent_state() -> None:
     global _GLOBAL_URGENT_STATE
-    active_flag = bool(active)
     with _URGENT_STATE_LOCK:
-        _GLOBAL_URGENT_STATE = active_flag
-    if active_flag:
+        combined = _BASE_URGENT_STATE or _MANUAL_URGENT_COUNT > 0
+        _GLOBAL_URGENT_STATE = combined
+    if combined:
         _URGENT_CLEAR_EVENT.clear()
     else:
         _URGENT_CLEAR_EVENT.set()
+
+
+def update_urgent_state(active: bool) -> None:
+    """Cache the urgent flag so background threads can read it without RPC."""
+
+    global _BASE_URGENT_STATE
+    with _URGENT_STATE_LOCK:
+        _BASE_URGENT_STATE = bool(active)
+    _recompute_global_urgent_state()
+
+
+def manual_urgent_enter() -> None:
+    """Enter a manual urgent window outside of the job-manager bookkeeping."""
+
+    global _MANUAL_URGENT_COUNT
+    with _URGENT_STATE_LOCK:
+        _MANUAL_URGENT_COUNT += 1
+    _recompute_global_urgent_state()
+
+
+def manual_urgent_exit() -> None:
+    """Release a manual urgent window previously entered."""
+
+    global _MANUAL_URGENT_COUNT
+    with _URGENT_STATE_LOCK:
+        if _MANUAL_URGENT_COUNT > 0:
+            _MANUAL_URGENT_COUNT -= 1
+    _recompute_global_urgent_state()
 
 
 def _is_global_urgent_active() -> bool:
@@ -390,16 +419,6 @@ def try_call_llm_dict(
             call_duration,
             thread_label,
         )
-        now = time.time()
-        total_duration = now - request_ts
-        call_duration = now - call_started_at
-        LOGGER.info(
-            "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
-            spec_key,
-            total_duration,
-            call_duration,
-            thread_label,
-        )
         _record_activity(spec_key, "success", None)
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
@@ -450,6 +469,8 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "manual_urgent_enter",
+    "manual_urgent_exit",
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",

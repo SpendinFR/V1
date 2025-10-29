@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Set, Iterable
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict, update_urgent_state
+from AGI_Evolutive.utils.llm_service import (
+    manual_urgent_enter,
+    manual_urgent_exit,
+    try_call_llm_dict,
+    update_urgent_state,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -205,6 +210,7 @@ class JobManager:
         self._urgent_token_counts: Dict[str, int] = collections.defaultdict(int)
         self._manual_urgent_counts: Dict[str, int] = collections.defaultdict(int)
         self._urgent_contexts: Dict[str, Set[str]] = {}
+        self._manual_urgent_contexts: Set[str] = set()
         self._urgent_state: bool = False
         self._urgent_condition = threading.Condition(self._lock)
 
@@ -815,8 +821,16 @@ class JobManager:
         if not normalized:
             return None
         ctx_id = str(uuid.uuid4())
+        manual_registered = False
+        try:
+            manual_urgent_enter()
+            manual_registered = True
+        except Exception:
+            manual_registered = False
         with self._lock:
             self._urgent_contexts[ctx_id] = set(normalized)
+            if manual_registered:
+                self._manual_urgent_contexts.add(ctx_id)
             for token in normalized:
                 self._manual_urgent_counts[token] += 1
             self._set_urgent_state_locked(True)
@@ -828,9 +842,12 @@ class JobManager:
             return
         with self._lock:
             tokens = self._urgent_contexts.pop(ctx_id, None)
+            manual_registered = ctx_id in self._manual_urgent_contexts
+            if manual_registered:
+                self._manual_urgent_contexts.discard(ctx_id)
             if not tokens:
                 _pop_thread_tokens(ctx_id)
-                return
+                tokens = set()
             for token in tokens:
                 count = self._manual_urgent_counts.get(token, 0)
                 if count <= 1:
@@ -839,6 +856,11 @@ class JobManager:
                     self._manual_urgent_counts[token] = count - 1
             self._set_urgent_state_locked(self._compute_urgent_state_locked())
         _pop_thread_tokens(ctx_id)
+        if manual_registered:
+            try:
+                manual_urgent_exit()
+            except Exception:
+                pass
 
     def _extract_priority_tokens(
         self, args: Dict[str, Any]
