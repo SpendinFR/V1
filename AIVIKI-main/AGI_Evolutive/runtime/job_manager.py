@@ -687,6 +687,21 @@ class JobManager:
             )
         return total <= 1
 
+    def has_active_urgent_chain(self) -> bool:
+        """Indique si une chaîne prioritaire (SIGNAL/THREAT/NEED) est active."""
+
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        with self._lock:
+            if any(count > 0 for count in self._urgent_token_counts.values()):
+                return True
+            for job_id in list(self._urgent_jobs):
+                job = self._jobs.get(job_id)
+                if not job:
+                    continue
+                if job.status in {"queued", "running"} and job.priority_tokens.intersection(urgent_types):
+                    return True
+        return False
+
     def _extract_priority_tokens(
         self, args: Dict[str, Any]
     ) -> Tuple[Optional[str], Set[str], Optional[str]]:

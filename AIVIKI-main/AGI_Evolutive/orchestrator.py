@@ -2209,7 +2209,13 @@ class Orchestrator:
         except Exception:
             pass
 
-        self.scheduler.tick()
+        if not self.job_manager.has_active_urgent_chain():
+            self.scheduler.tick()
+        else:
+            try:
+                logger.debug("Skip scheduler tick: urgent chain active")
+            except Exception:
+                pass
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
