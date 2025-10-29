@@ -2,7 +2,7 @@
 # idempotence, progrès, persistance JSONL, drain des complétions côté thread principal).
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, List, Deque, Tuple
+from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Set
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
 
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
@@ -50,6 +50,7 @@ class Job:
     predicted_priority: float = 0.0
     context_features: Dict[str, float] = field(default_factory=dict, repr=False)
     metrics: Dict[str, Any] = field(default_factory=dict, repr=False)
+    priority_tokens: Set[str] = field(default_factory=set, repr=False)
 
 
 class JobContext:
@@ -147,6 +148,7 @@ class JobManager:
         os.makedirs(os.path.dirname(self.paths["log"]), exist_ok=True)
 
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._model_lock = threading.RLock()
         self._stats_lock = threading.RLock()
         self._seq = 0
@@ -157,6 +159,8 @@ class JobManager:
         self._pq_back: List[_PQItem] = []
         self._completions: Deque[Dict[str, Any]] = collections.deque(maxlen=512)
         self._priority_model = _OnlinePriorityModel()
+        self._urgent_jobs: Set[str] = set()
+        self._urgent_token_counts: Dict[str, int] = collections.defaultdict(int)
 
         # budgets (ajuste si besoin)
         self.budgets = {
@@ -176,15 +180,8 @@ class JobManager:
 
         # Démarre les workers
         self._alive = True
-        self._workers: List[threading.Thread] = []
-        for _ in range(workers_interactive):
-            t = threading.Thread(target=self._worker_loop, args=("interactive",), daemon=True)
-            t.start()
-            self._workers.append(t)
-        for _ in range(workers_background):
-            t = threading.Thread(target=self._worker_loop, args=("background",), daemon=True)
-            t.start()
-            self._workers.append(t)
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
 
     def _current_focus_topic(self) -> Optional[str]:
         arch = getattr(self, "arch", None)
@@ -258,10 +255,13 @@ class JobManager:
                     return jid
 
             jid = str(uuid.uuid4())
+            trigger_token, chain_tokens, source_token = self._extract_priority_tokens(args)
+            lane_override_hint = self._should_force_interactive(args)
+            effective_queue = "interactive" if lane_override_hint else queue
             job = Job(
                 id=jid,
                 kind=kind,
-                queue=queue,
+                queue=effective_queue,
                 priority=priority,
                 fn=fn,
                 args=args,
@@ -281,8 +281,15 @@ class JobManager:
             adjusted_priority = self._blend_priority(priority, model_pred, confidence, noise)
             if llm_overlay is not None:
                 adjusted_priority = max(0.0, min(1.0, float(llm_overlay)))
+            override = self._priority_override(job, args)
+            if override is not None:
+                adjusted_priority = override[0]
+                job.metrics.setdefault("overrides", {})["trigger_priority"] = override[1]
             job.predicted_priority = model_pred
             job.priority = adjusted_priority
+            if lane_override_hint:
+                job.metrics.setdefault("overrides", {})["lane"] = lane_override_hint
+            self._register_priority_tokens(job, trigger_token, chain_tokens, source_token)
             job.metrics.update(
                 {
                     "model_prediction": model_pred,
@@ -301,6 +308,8 @@ class JobManager:
                 self._key_map[key] = jid
             self._push_pq(job)
             self._log({"event": "submit", "job": self._job_view(job)})
+            with self._condition:
+                self._condition.notify_all()
             return jid
 
     def _llm_rescore(self, job: Job, context_features: Dict[str, float]) -> Optional[float]:
@@ -364,24 +373,60 @@ class JobManager:
     # ------------------- internes -------------------
     def _push_pq(self, job: Job):
         self._seq += 1
-        item = _PQItem(neg_prio=-float(job.priority), created_ts=job.created_ts, seq=self._seq, job_id=job.id)
+        effective_priority = float(job.priority)
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if job.priority_tokens and job.priority_tokens.intersection(urgent_types):
+            effective_priority += 1e-3
+        item = _PQItem(
+            neg_prio=-effective_priority,
+            created_ts=job.created_ts,
+            seq=self._seq,
+            job_id=job.id,
+        )
         if job.queue == "interactive":
             heapq.heappush(self._pq_inter, item)
         else:
             heapq.heappush(self._pq_back, item)
 
-    def _pop_next(self, lane: str) -> Optional[str]:
-        with self._lock:
-            pq = self._pq_inter if lane == "interactive" else self._pq_back
-            if not pq:
-                return None
-            # budget: nombre max de jobs simultanés par file
-            running = self._running_inter if lane == "interactive" else self._running_back
-            maxrun = self.budgets[lane]["max_running"]
-            if running >= maxrun:
-                return None
-            item = heapq.heappop(pq)
-            return item.job_id
+    def _select_next_job_locked(self) -> Tuple[Optional[str], Optional[str]]:
+        lane_item: Optional[Tuple[str, _PQItem]] = None
+        urgent_active = any(count > 0 for count in self._urgent_token_counts.values())
+        if self._pq_inter:
+            lane_item = ("interactive", self._pq_inter[0])
+        if self._pq_back:
+            back_item = self._pq_back[0]
+            if lane_item is None:
+                lane_item = ("background", back_item)
+            elif not urgent_active:
+                current_lane, current_item = lane_item
+                current_prio = -float(current_item.neg_prio)
+                back_prio = -float(back_item.neg_prio)
+                if back_prio > current_prio:
+                    lane_item = ("background", back_item)
+                elif math.isclose(back_prio, current_prio):
+                    if current_lane != "interactive":
+                        lane_item = ("interactive", self._pq_inter[0])
+                    else:
+                        if back_item.created_ts < current_item.created_ts:
+                            lane_item = ("background", back_item)
+        if lane_item is None:
+            return None, None
+        lane, item = lane_item
+        pq = self._pq_inter if lane == "interactive" else self._pq_back
+        heapq.heappop(pq)
+        return lane, item.job_id
+
+    def _pop_next_any(self) -> Tuple[Optional[str], Optional[str]]:
+        with self._condition:
+            while self._alive:
+                if self._running_inter or self._running_back:
+                    self._condition.wait(timeout=0.1)
+                    continue
+                lane, jid = self._select_next_job_locked()
+                if jid is not None:
+                    return lane, jid
+                self._condition.wait(timeout=0.1)
+            return None, None
 
     def _compute_reward(self, j: Job) -> Tuple[float, float]:
         finished = j.finished_ts or _now()
@@ -492,6 +537,7 @@ class JobManager:
         self._log({"event": "start", "job": self._job_view(j)})
 
     def _finish_job(self, j: Job, ok: bool, result: Any = None, error: Optional[str] = None, trace: Optional[str] = None):
+        self._release_priority_tokens(j)
         j.finished_ts = _now()
         j.status = "done" if ok else ("cancelled" if (j.id in self._cancelled) else "error")
         j.result = result
@@ -544,15 +590,17 @@ class JobManager:
         with self._lock:
             return job_id in self._cancelled
 
-    def _worker_loop(self, lane: str):
+    def _worker_loop(self):
         while self._alive:
-            jid = self._pop_next(lane)
-            if not jid:
+            lane, jid = self._pop_next_any()
+            if jid is None:
                 time.sleep(0.01)
                 continue
             with self._lock:
                 j = self._jobs.get(jid)
             if not j:
+                with self._condition:
+                    self._condition.notify_all()
                 continue
             # cancellation avant start ?
             if self._is_cancelled(j.id):
@@ -571,6 +619,8 @@ class JobManager:
             if self._is_cancelled(j.id) and ok:
                 ok, err = False, "cancelled"
             self._finish_job(j, ok=ok, result=result, error=err, trace=tr)
+            with self._condition:
+                self._condition.notify_all()
 
     def _job_view(self, j: Optional[Job]) -> Optional[Dict[str, Any]]:
         if not j:
@@ -604,6 +654,140 @@ class JobManager:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def wait_for(self, job_id: str, *, poll_interval: float = 0.05, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        deadline = None
+        if timeout is not None:
+            deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job and job.status in {"done", "error", "cancelled"}:
+                    event = {
+                        "event": "done" if job.status == "done" else job.status,
+                        "job": self._job_view(job),
+                        "result": job.result,
+                        "error": job.error,
+                        "trace": job.trace,
+                    }
+                    if job.metrics:
+                        event["metrics"] = dict(job.metrics)
+                    return event
+            if deadline is not None and time.time() >= deadline:
+                return None
+            time.sleep(max(0.001, poll_interval))
+
+    def is_low_load(self) -> bool:
+        with self._lock:
+            total = (
+                len(self._pq_inter)
+                + len(self._pq_back)
+                + self._running_inter
+                + self._running_back
+            )
+        return total <= 1
+
+    def has_active_urgent_chain(self) -> bool:
+        """Indique si une chaîne prioritaire (SIGNAL/THREAT/NEED) est active."""
+
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        with self._lock:
+            if any(count > 0 for count in self._urgent_token_counts.values()):
+                return True
+            for job_id in list(self._urgent_jobs):
+                job = self._jobs.get(job_id)
+                if not job:
+                    continue
+                if job.status in {"queued", "running"} and job.priority_tokens.intersection(urgent_types):
+                    return True
+        return False
+
+    def _extract_priority_tokens(
+        self, args: Dict[str, Any]
+    ) -> Tuple[Optional[str], Set[str], Optional[str]]:
+        if not isinstance(args, dict):
+            return None, set(), None
+        meta = args.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        trigger_raw = meta.get("trigger_type")
+        trigger_token = trigger_raw.strip().upper() if isinstance(trigger_raw, str) else None
+        chain_tokens: Set[str] = set()
+        chain = meta.get("priority_chain")
+        if isinstance(chain, (list, tuple, set)):
+            for item in chain:
+                if isinstance(item, str):
+                    token = item.strip().upper()
+                    if token:
+                        chain_tokens.add(token)
+        if trigger_token:
+            chain_tokens.add(trigger_token)
+        source_raw = meta.get("source") or meta.get("origin")
+        source_token = source_raw.strip().lower() if isinstance(source_raw, str) else None
+        return trigger_token, chain_tokens, source_token
+
+    def _priority_override(self, job: Job, args: Dict[str, Any]) -> Optional[Tuple[float, str]]:
+        trigger_token, chain_tokens, source_token = self._extract_priority_tokens(args)
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if trigger_token in urgent_types:
+            return 1.0, f"trigger:{trigger_token}"
+        urgent_chain = chain_tokens.intersection(urgent_types)
+        if urgent_chain:
+            joined = ",".join(sorted(urgent_chain))
+            return 1.0, f"chain:{joined}"
+        if source_token in {"user", "interaction"}:
+            return max(float(job.priority), 0.9), f"source:{source_token}"
+        return None
+
+    def _register_priority_tokens(
+        self,
+        job: Job,
+        trigger_token: Optional[str],
+        chain_tokens: Set[str],
+        source_token: Optional[str],
+    ) -> None:
+        tokens: Set[str] = set()
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if trigger_token:
+            tokens.add(trigger_token)
+        tokens.update(chain_tokens)
+        if tokens:
+            job.priority_tokens = set(tokens)
+            job.metrics.setdefault("priority_tokens", sorted(tokens))
+        if source_token:
+            job.metrics.setdefault("priority_source", source_token)
+        urgent_tokens = {tok for tok in tokens if tok in urgent_types}
+        if urgent_tokens:
+            overrides = job.metrics.setdefault("overrides", {})
+            overrides["urgent_tokens"] = sorted(urgent_tokens)
+            self._urgent_jobs.add(job.id)
+            for tok in urgent_tokens:
+                self._urgent_token_counts[tok] += 1
+
+    def _release_priority_tokens(self, job: Job) -> None:
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        urgent_tokens = {tok for tok in job.priority_tokens if tok in urgent_types}
+        if not urgent_tokens:
+            return
+        with self._lock:
+            self._urgent_jobs.discard(job.id)
+            for tok in urgent_tokens:
+                count = self._urgent_token_counts.get(tok, 0)
+                if count <= 1:
+                    self._urgent_token_counts.pop(tok, None)
+                else:
+                    self._urgent_token_counts[tok] = count - 1
+        job.priority_tokens.clear()
+
+    def _should_force_interactive(self, args: Dict[str, Any]) -> Optional[str]:
+        trigger_token, chain_tokens, _ = self._extract_priority_tokens(args)
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if trigger_token in urgent_types:
+            return f"trigger:{trigger_token}"
+        urgent_chain = chain_tokens.intersection(urgent_types)
+        if urgent_chain:
+            return f"chain:{','.join(sorted(urgent_chain))}"
+        return None
 
     def snapshot_identity_view(self) -> Dict[str, Any]:
         """Small summary of running and recent jobs for the SelfModel."""
