@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from contextlib import nullcontext
 from types import SimpleNamespace
 from collections import deque, defaultdict
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Mapping
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Mapping, Set
 
 try:  # pragma: no cover - platform specific import
     import resource as _resource
@@ -1108,6 +1108,11 @@ class Orchestrator:
             job_manager = existing_jobs
 
         self.job_manager = job_manager
+        try:
+            setattr(self.arch, "jobs", job_manager)
+            setattr(self.arch, "job_manager", job_manager)
+        except Exception:
+            pass
         self._phenomenal_kernel = PhenomenalKernel()
         self.phenomenal_journal = getattr(self, "phenomenal_journal", None) or PhenomenalJournal()
         self.phenomenal_recall = getattr(self, "phenomenal_recall", None) or PhenomenalRecall(
@@ -1205,6 +1210,13 @@ class Orchestrator:
                 skills=getattr(self.arch, "skill_sandbox", None),
                 job_bases=self._job_base_budgets,
             )
+        try:
+            self._action_interface.bind(
+                jobs=job_manager,
+                job_bases=self._job_base_budgets,
+            )
+        except Exception:
+            pass
         self._perception_interface = PerceptionInterface(self._memory_store)
         self.curiosity = CuriosityEngine(architecture=self.arch)
 
@@ -2209,7 +2221,27 @@ class Orchestrator:
         except Exception:
             pass
 
-        self.scheduler.tick()
+        cycle_ctx_id: Optional[str] = None
+        jm = getattr(self, "job_manager", None)
+        if user_msg and jm and hasattr(jm, "activate_urgent_context"):
+            try:
+                cycle_ctx_id = jm.activate_urgent_context(["SIGNAL"])
+            except Exception:
+                cycle_ctx_id = None
+        try:
+            if not jm or not hasattr(jm, "has_active_urgent_chain") or not jm.has_active_urgent_chain():
+                self.scheduler.tick()
+            else:
+                try:
+                    logger.debug("Skip scheduler tick: urgent chain active")
+                except Exception:
+                    pass
+        finally:
+            if cycle_ctx_id and hasattr(jm, "deactivate_urgent_context"):
+                try:
+                    jm.deactivate_urgent_context(cycle_ctx_id)
+                except Exception:
+                    pass
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
@@ -2482,12 +2514,36 @@ class Orchestrator:
         return contexts
 
     # --- Pipeline -----------------------------------------------------------
-    def _submit_for_mode(self, mode: ActMode, action: Dict[str, Any], meta: Dict[str, Any], prio: float) -> str:
+    def _submit_for_mode(self, mode: ActMode, action: Dict[str, Any], trigger: Trigger, prio: float) -> str:
+        trigger_meta = dict(trigger.meta or {})
+        trigger_meta.setdefault("trigger_type", trigger.type.name)
+        chain = list(trigger_meta.get("priority_chain") or [])
+        if trigger.type.name not in chain:
+            chain.append(trigger.type.name)
+        trigger_meta["priority_chain"] = chain
+
+        action_payload = dict(action or {})
+        context = dict(action_payload.get("context") or {})
+        context.setdefault("priority_chain", list(chain))
+        context.setdefault("trigger_type", trigger.type.name)
+        if "source" not in context and isinstance(trigger_meta.get("source"), str):
+            context["source"] = trigger_meta["source"]
+        action_payload["context"] = context
+
+        urgent_types = {TriggerType.SIGNAL, TriggerType.THREAT, TriggerType.NEED}
+        effective_priority = prio
+        if trigger.type in urgent_types:
+            effective_priority = 1.0
+        else:
+            source = str(trigger_meta.get("source", "")).lower()
+            if source in {"user", "interaction"}:
+                effective_priority = max(effective_priority, 0.9)
+
         if mode is ActMode.REFLEX:
             return self.job_manager.submit(
                 kind="action.reflex",
                 fn=self._run_action,
-                args={"action": action, "meta": meta, "mode": "reflex"},
+                args={"action": action_payload, "meta": trigger_meta, "mode": "reflex"},
                 queue="interactive",
                 priority=1.0,
                 timeout_s=2.0,
@@ -2496,17 +2552,17 @@ class Orchestrator:
             return self.job_manager.submit(
                 kind="action.habit",
                 fn=self._run_action,
-                args={"action": action, "meta": meta, "mode": "habit"},
+                args={"action": action_payload, "meta": trigger_meta, "mode": "habit"},
                 queue="interactive",
-                priority=max(0.6, prio),
+                priority=max(0.6, effective_priority),
                 timeout_s=10.0,
             )
         return self.job_manager.submit(
             kind="action.deliberate",
             fn=self._run_action,
-            args={"action": action, "meta": meta, "mode": "deliberate"},
+            args={"action": action_payload, "meta": trigger_meta, "mode": "deliberate"},
             queue="background",
-            priority=min(0.95, prio),
+            priority=effective_priority,
             timeout_s=300.0,
         )
 
@@ -2622,7 +2678,7 @@ class Orchestrator:
         result["meta"] = args.get("meta", {})
         return result
 
-    def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+    def _run_pipeline_inner(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:
@@ -3017,19 +3073,19 @@ class Orchestrator:
                     jid = self._submit_for_mode(
                         mode,
                         action,
-                        trigger.meta,
+                        trigger,
                         ctx["scratch"].get("priority", 0.6),
                     )
-                    events = self.job_manager.poll_completed(32)
+                    completion = self.job_manager.wait_for(jid)
                     result: Optional[Dict[str, Any]] = None
-                    for ev in events:
-                        job = ev.get("job", {})
-                        if job.get("id") == jid:
-                            ctx["obtained"] = {
-                                "score": 1.0 if ev.get("event") == "done" else 0.0
-                            }
-                            result = ev.get("result") if isinstance(ev, dict) else None
-                            break
+                    if completion:
+                        job_event = completion.get("event")
+                        ctx["obtained"] = {
+                            "score": 1.0 if job_event == "done" else 0.0
+                        }
+                        result = completion.get("result") if isinstance(completion, dict) else None
+                    else:
+                        ctx["obtained"] = {"score": 0.0}
                     decision = ctx.get("decision") or {}
                     obtained_score = (
                         1.0
@@ -3637,6 +3693,35 @@ class Orchestrator:
             except Exception:
                 pass
         return ctx
+
+    def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        job_manager = getattr(self, "job_manager", None)
+        urgent_types = {TriggerType.SIGNAL, TriggerType.THREAT, TriggerType.NEED}
+        trigger_meta = trigger.meta or {}
+        tokens: Set[str] = set()
+        if trigger.type in urgent_types:
+            tokens.add(trigger.type.name)
+        chain = trigger_meta.get("priority_chain")
+        if isinstance(chain, (list, tuple, set)):
+            for item in chain:
+                if isinstance(item, str):
+                    token = item.strip().upper()
+                    if token:
+                        tokens.add(token)
+        ctx_id: Optional[str] = None
+        if job_manager and hasattr(job_manager, "activate_urgent_context"):
+            try:
+                ctx_id = job_manager.activate_urgent_context(tokens)
+            except Exception:
+                ctx_id = None
+        try:
+            return self._run_pipeline_inner(trigger)
+        finally:
+            if job_manager and hasattr(job_manager, "deactivate_urgent_context"):
+                try:
+                    job_manager.deactivate_urgent_context(ctx_id)
+                except Exception:
+                    pass
 
     def _phenomenal_identity_snapshot(self) -> Tuple[List[str], List[str]]:
         values: List[str] = []
