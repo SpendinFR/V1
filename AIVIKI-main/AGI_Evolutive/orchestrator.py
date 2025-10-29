@@ -2482,12 +2482,36 @@ class Orchestrator:
         return contexts
 
     # --- Pipeline -----------------------------------------------------------
-    def _submit_for_mode(self, mode: ActMode, action: Dict[str, Any], meta: Dict[str, Any], prio: float) -> str:
+    def _submit_for_mode(self, mode: ActMode, action: Dict[str, Any], trigger: Trigger, prio: float) -> str:
+        trigger_meta = dict(trigger.meta or {})
+        trigger_meta.setdefault("trigger_type", trigger.type.name)
+        chain = list(trigger_meta.get("priority_chain") or [])
+        if trigger.type.name not in chain:
+            chain.append(trigger.type.name)
+        trigger_meta["priority_chain"] = chain
+
+        action_payload = dict(action or {})
+        context = dict(action_payload.get("context") or {})
+        context.setdefault("priority_chain", list(chain))
+        context.setdefault("trigger_type", trigger.type.name)
+        if "source" not in context and isinstance(trigger_meta.get("source"), str):
+            context["source"] = trigger_meta["source"]
+        action_payload["context"] = context
+
+        urgent_types = {TriggerType.SIGNAL, TriggerType.THREAT, TriggerType.NEED}
+        effective_priority = prio
+        if trigger.type in urgent_types:
+            effective_priority = 1.0
+        else:
+            source = str(trigger_meta.get("source", "")).lower()
+            if source in {"user", "interaction"}:
+                effective_priority = max(effective_priority, 0.9)
+
         if mode is ActMode.REFLEX:
             return self.job_manager.submit(
                 kind="action.reflex",
                 fn=self._run_action,
-                args={"action": action, "meta": meta, "mode": "reflex"},
+                args={"action": action_payload, "meta": trigger_meta, "mode": "reflex"},
                 queue="interactive",
                 priority=1.0,
                 timeout_s=2.0,
@@ -2496,17 +2520,17 @@ class Orchestrator:
             return self.job_manager.submit(
                 kind="action.habit",
                 fn=self._run_action,
-                args={"action": action, "meta": meta, "mode": "habit"},
+                args={"action": action_payload, "meta": trigger_meta, "mode": "habit"},
                 queue="interactive",
-                priority=max(0.6, prio),
+                priority=max(0.6, effective_priority),
                 timeout_s=10.0,
             )
         return self.job_manager.submit(
             kind="action.deliberate",
             fn=self._run_action,
-            args={"action": action, "meta": meta, "mode": "deliberate"},
+            args={"action": action_payload, "meta": trigger_meta, "mode": "deliberate"},
             queue="background",
-            priority=min(0.95, prio),
+            priority=effective_priority,
             timeout_s=300.0,
         )
 
@@ -3017,19 +3041,19 @@ class Orchestrator:
                     jid = self._submit_for_mode(
                         mode,
                         action,
-                        trigger.meta,
+                        trigger,
                         ctx["scratch"].get("priority", 0.6),
                     )
-                    events = self.job_manager.poll_completed(32)
+                    completion = self.job_manager.wait_for(jid)
                     result: Optional[Dict[str, Any]] = None
-                    for ev in events:
-                        job = ev.get("job", {})
-                        if job.get("id") == jid:
-                            ctx["obtained"] = {
-                                "score": 1.0 if ev.get("event") == "done" else 0.0
-                            }
-                            result = ev.get("result") if isinstance(ev, dict) else None
-                            break
+                    if completion:
+                        job_event = completion.get("event")
+                        ctx["obtained"] = {
+                            "score": 1.0 if job_event == "done" else 0.0
+                        }
+                        result = completion.get("result") if isinstance(completion, dict) else None
+                    else:
+                        ctx["obtained"] = {"score": 0.0}
                     decision = ctx.get("decision") or {}
                     obtained_score = (
                         1.0
