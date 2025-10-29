@@ -108,6 +108,11 @@ class JobContext:
     def cancelled(self) -> bool:
         return self._jm._is_cancelled(self._job_id)
 
+    def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
+        """Bloque si une chaîne urgente est active (pour jobs coopératifs)."""
+
+        return self._jm.pause_if_urgent_active(timeout=timeout)
+
 
 class _OnlinePriorityModel:
     """Petit modèle logistique online pour ajuster les priorités."""
@@ -659,6 +664,10 @@ class JobManager:
                 continue
             with self._lock:
                 j = self._jobs.get(jid)
+                if j and lane == "background" and self._should_defer_background_locked():
+                    self._push_pq(j)
+                    self._condition.notify_all()
+                    continue
             if not j:
                 with self._condition:
                     self._condition.notify_all()
@@ -760,6 +769,11 @@ class JobManager:
             self._set_urgent_state_locked(active)
             return active
 
+    def is_urgent_active(self) -> bool:
+        """Public API used by the scheduler to query urgent chains."""
+
+        return self.has_active_urgent_chain()
+
     def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
         """Bloque brièvement l'appelant si une chaîne urgente est active."""
 
@@ -768,6 +782,14 @@ class JobManager:
                 return False
             self._urgent_condition.wait(timeout)
             return True
+
+    def wait_until_cleared(self, timeout: float = 0.5) -> None:
+        """Bloque jusqu'à dissipation de la fenêtre urgente ou timeout."""
+
+        with self._urgent_condition:
+            if not self._urgent_state:
+                return
+            self._urgent_condition.wait(timeout)
 
     def _compute_urgent_state_locked(self) -> bool:
         urgent_types = {"SIGNAL", "THREAT", "NEED"}

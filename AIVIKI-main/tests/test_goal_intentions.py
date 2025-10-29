@@ -102,21 +102,48 @@ def test_probe_generated_on_low_confidence(goal_system):
     assert types[1] == "reflect"
 
 
-def test_structural_hierarchy_creates_depth_two_children(goal_system):
+def test_structural_hierarchy_seeds_branch_on_activation(goal_system):
     goal_system.step()
     root = next(node for node in goal_system.store.nodes.values() if not node.parent_ids)
-    grandchildren = []
+
+    initial_grandchildren = []
     for child_id in root.child_ids:
         child = goal_system.store.nodes[child_id]
-        for cid in child.child_ids:
-            grandchildren.append(goal_system.store.nodes[cid].description)
-    assert any(desc.startswith("Formuler une hypothèse") for desc in grandchildren)
-    assert any("QuestionManager" in desc for desc in grandchildren)
-    assert any("Analyser l'inbox" in desc or "Consigner l'hypothèse" in desc for desc in grandchildren)
+        initial_grandchildren.extend(child.child_ids)
+    assert not initial_grandchildren, "Les sous-objectifs profonds ne doivent pas être créés avant l'activation."
+
+    focus_child = goal_system.store.nodes[root.child_ids[0]]
+    goal_system.store.set_active(focus_child.id)
+    goal_system._refresh_active_goal()
+    goal_system._ensure_structural_hierarchy()
+
+    refreshed = goal_system.store.nodes[focus_child.id]
+    seeded_descriptions = [goal_system.store.nodes[cid].description for cid in refreshed.child_ids]
+    assert any(desc.startswith("Formuler une hypothèse") for desc in seeded_descriptions)
+    assert any("QuestionManager" in desc for desc in seeded_descriptions)
+    assert any("Analyser l'inbox" in desc or "Consigner l'hypothèse" in desc for desc in seeded_descriptions)
 
 
 def test_goal_completion_updates_status_and_memory(goal_system_with_memory):
     system, memory = goal_system_with_memory
+    clarifier = next(
+        node
+        for node in system.store.nodes.values()
+        if "Clarifier qui je suis" in node.description and node.parent_ids
+    )
+    system.store.set_active(clarifier.id)
+    system._refresh_active_goal()
+    system._ensure_structural_hierarchy()
+
+    hypothesis = next(
+        node
+        for node in system.store.nodes.values()
+        if "Formuler une hypothèse" in node.description and clarifier.id in node.parent_ids
+    )
+    system.store.set_active(hypothesis.id)
+    system._refresh_active_goal()
+    system._ensure_structural_hierarchy()
+
     leaf = next(
         node
         for node in system.store.nodes.values()

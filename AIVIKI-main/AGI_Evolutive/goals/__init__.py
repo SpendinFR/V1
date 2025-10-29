@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from .curiosity import CuriosityEngine
-from .dag_store import DagStore, GoalNode
+from .dag_store import DagStore, GoalNode, normalize_goal_signature
 from .heuristics import HeuristicRegistry, default_heuristics
 from .intention_classifier import IntentionModel
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
@@ -90,6 +90,7 @@ class GoalSystem:
         )
         self.metadata: Dict[str, GoalMetadata] = {}
         self.pending_actions: Deque[Dict[str, Any]] = deque()
+        self._parked_actions: List[Dict[str, Any]] = []
         self.curiosity = CuriosityEngine(architecture=architecture)
         self.heuristics: HeuristicRegistry = default_heuristics()
         self.intention_model = IntentionModel(data_path=intention_data_path)
@@ -129,7 +130,6 @@ class GoalSystem:
                     awakening_block = False
         if awakening_block:
             self.set_question_block(True)
-            self.pending_actions.clear()
             return
         else:
             self.set_question_block(False)
@@ -138,7 +138,6 @@ class GoalSystem:
             self._record_feedback(user_msg)
 
         if self._question_blocked:
-            self.pending_actions.clear()
             return
 
         if self._should_autopropose():
@@ -149,7 +148,13 @@ class GoalSystem:
     def get_next_action(self) -> Optional[Dict[str, Any]]:
         self._ensure_pending_actions()
         if self.pending_actions:
-            return self.pending_actions.popleft()
+            action = self.pending_actions.popleft()
+            goal = self.store.get_active()
+            if goal and isinstance(action, dict):
+                action_type = action.get("type")
+                if action_type:
+                    self.store.update_goal(goal.id, {"last_action_type": action_type})
+            return action
         return None
 
     def pop_next_action(self) -> Optional[Dict[str, Any]]:
@@ -213,6 +218,11 @@ class GoalSystem:
             urgency=urgency,
             parent_ids=parent_ids_list,
         )
+        if node.id in self.metadata:
+            existing_meta = self.metadata[node.id]
+            if criteria_payload and not existing_meta.success_criteria:
+                existing_meta.success_criteria = list(criteria_payload)
+            return node
         depth = self._compute_depth(parent_ids_list)
         metadata = GoalMetadata(
             goal_type=enriched_goal_type,
@@ -562,6 +572,8 @@ class GoalSystem:
                 metadata.structural_seeded = False
             else:
                 return
+        if not self._should_seed_structural_children(goal, metadata):
+            return
         if goal.created_by not in {"system", "structure"}:
             metadata.structural_seeded = True
             return
@@ -581,7 +593,7 @@ class GoalSystem:
             child = existing.get(key)
             if child:
                 child_meta = self.metadata.get(child.id)
-                if child_meta:
+                if child_meta and self._should_seed_structural_children(child, child_meta):
                     self._ensure_structural_children(child, child_meta)
                 continue
             child = self.add_goal(
@@ -601,12 +613,21 @@ class GoalSystem:
                 child_meta.goal_type = template.get("goal_type", child_meta.goal_type)
                 if template.get("structural_seeded", False):
                     child_meta.structural_seeded = True
-                if not child_meta.structural_seeded:
+                if not child_meta.structural_seeded and self._should_seed_structural_children(child, child_meta):
                     self._ensure_structural_children(child, child_meta)
             existing[key] = child
             created = True
         if created or existing:
             metadata.structural_seeded = True
+
+    def _should_seed_structural_children(self, goal: GoalNode, metadata: GoalMetadata) -> bool:
+        if metadata.depth == 0:
+            return True
+        if goal.status == "active" or self.store.active_goal_id == goal.id:
+            return True
+        if goal.progress >= 0.05:
+            return True
+        return False
 
     def _missing_structural_templates(
         self, goal: GoalNode, templates: List[Dict[str, Any]]
@@ -626,6 +647,149 @@ class GoalSystem:
         return bool(expected.difference(existing))
 
     def _structural_templates_for_goal(
+        self, goal: GoalNode, metadata: GoalMetadata
+    ) -> List[Dict[str, Any]]:
+        fallback = self._static_structural_templates(goal, metadata)
+        llm_templates = self._llm_structural_templates(goal, metadata, fallback)
+        if llm_templates:
+            return llm_templates
+        return fallback
+
+    def _llm_structural_templates(
+        self,
+        goal: GoalNode,
+        metadata: GoalMetadata,
+        fallback: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        try:
+            parent = self.store.nodes.get(goal.parent_ids[0]) if goal.parent_ids else None
+        except Exception:
+            parent = None
+
+        snapshot = {
+            "id": goal.id,
+            "description": goal.description,
+            "created_by": goal.created_by,
+            "status": goal.status,
+            "value": goal.value,
+            "competence": goal.competence,
+            "curiosity": goal.curiosity,
+            "urgency": goal.urgency,
+            "progress": goal.progress,
+            "parent_ids": list(goal.parent_ids),
+            "child_ids": list(goal.child_ids),
+            "depth": metadata.depth,
+        }
+        if goal.evidence:
+            snapshot["recent_evidence"] = goal.evidence[-3:]
+
+        payload = {
+            "goal": snapshot,
+            "parent": (
+                {
+                    "id": parent.id,
+                    "description": parent.description,
+                    "created_by": parent.created_by,
+                    "status": parent.status,
+                }
+                if parent
+                else None
+            ),
+            "fallback_children": [
+                {
+                    "description": child.get("description"),
+                    "criteria": child.get("criteria", []),
+                    "goal_type": (
+                        child.get("goal_type").value
+                        if isinstance(child.get("goal_type"), GoalType)
+                        else child.get("goal_type")
+                    ),
+                    "value": child.get("value"),
+                    "competence": child.get("competence"),
+                    "curiosity": child.get("curiosity"),
+                    "urgency": child.get("urgency"),
+                }
+                for child in fallback
+            ],
+        }
+
+        response = try_call_llm_dict(
+            "goal_structural_children",
+            input_payload=payload,
+            logger=logger,
+            max_retries=2,
+        )
+
+        if not response:
+            return []
+
+        notes = response.get("notes")
+        if notes:
+            try:
+                metadata.llm_notes.append(str(notes))
+            except Exception:
+                pass
+        confidence = response.get("confidence")
+        if isinstance(confidence, (int, float)):
+            metadata.llm_confidence = float(max(0.0, min(1.0, confidence)))
+
+        children = response.get("children")
+        if not isinstance(children, list):
+            return []
+
+        sanitized: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for entry in children:
+            if not isinstance(entry, dict):
+                continue
+            description = str(entry.get("description", "")).strip()
+            if not description:
+                continue
+            key = description.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            goal_type_value = entry.get("goal_type")
+            goal_type = metadata.goal_type
+            if isinstance(goal_type_value, GoalType):
+                goal_type = goal_type_value
+            elif isinstance(goal_type_value, str):
+                normalized = goal_type_value.strip().lower()
+                for candidate in GoalType:
+                    if normalized in {candidate.value, candidate.name.lower()}:
+                        goal_type = candidate
+                        break
+
+            criteria_iter = entry.get("criteria")
+            criteria: List[str] = []
+            if isinstance(criteria_iter, list):
+                for crit in criteria_iter:
+                    if isinstance(crit, str) and crit.strip():
+                        criteria.append(crit.strip())
+
+            def _clamp(value: Any, default: float) -> float:
+                try:
+                    return float(max(0.0, min(1.0, float(value))))
+                except Exception:
+                    return float(max(0.0, min(1.0, default)))
+
+            sanitized.append(
+                {
+                    "description": description,
+                    "criteria": criteria,
+                    "goal_type": goal_type,
+                    "value": _clamp(entry.get("value"), goal.value),
+                    "competence": _clamp(entry.get("competence"), goal.competence),
+                    "curiosity": _clamp(entry.get("curiosity"), goal.curiosity),
+                    "urgency": _clamp(entry.get("urgency"), goal.urgency),
+                    "structural_seeded": bool(entry.get("structural_seeded", False)),
+                }
+            )
+
+        return sanitized
+
+    def _static_structural_templates(
         self, goal: GoalNode, metadata: GoalMetadata
     ) -> List[Dict[str, Any]]:
         if metadata.depth == 0:
@@ -917,6 +1081,14 @@ class GoalSystem:
         parent_payload = active.to_dict() if active else None
         proposals = self.curiosity.suggest_subgoals(parent_payload)
         for proposal in proposals:
+            signature = normalize_goal_signature(
+                proposal.get("description", ""),
+                proposal.get("criteria"),
+                proposal.get("parent_ids"),
+            )
+            if self.store.has_goal_signature(signature) or self.curiosity.is_signature_known(signature):
+                self.curiosity.mark_signature(signature)
+                continue
             node = self.add_goal(
                 proposal.get("description", "Explorer un nouveau sujet"),
                 goal_type=GoalType.EXPLORATION,
@@ -930,6 +1102,7 @@ class GoalSystem:
             )
             if node.created_by == "curiosity":
                 self.curiosity.register_proposal(node.id, proposal)
+            self.curiosity.mark_signature(signature)
         self.last_auto_proposal_at = time.time()
 
     def _ensure_pending_actions(self) -> None:
@@ -993,6 +1166,17 @@ class GoalSystem:
                     "priority": min(1.0, goal.priority + 0.1),
                 }
             )
+        return self._avoid_redundant_first_action(goal, actions)
+
+    def _avoid_redundant_first_action(
+        self, goal: GoalNode, actions: Deque[Dict[str, Any]]
+    ) -> Deque[Dict[str, Any]]:
+        if not actions:
+            return actions
+        first = actions[0]
+        first_type = first.get("type") if isinstance(first, dict) else None
+        if first_type and goal.last_action_type == first_type and len(actions) > 1:
+            actions.popleft()
         return actions
 
     def set_question_block(self, blocked: bool) -> None:
@@ -1001,9 +1185,16 @@ class GoalSystem:
             return
         self._question_blocked = flag
         if flag:
+            if self.pending_actions:
+                self._parked_actions = list(self.pending_actions)
+            else:
+                self._parked_actions = []
             self.pending_actions.clear()
             message = "Blocage des objectifs primaires: en attente de réponses utilisateur"
         else:
+            if self._parked_actions:
+                self.pending_actions.extend(self._parked_actions)
+                self._parked_actions = []
             message = "Reprise des objectifs primaires: backlog de questions réduit"
         try:
             logger.info(message)

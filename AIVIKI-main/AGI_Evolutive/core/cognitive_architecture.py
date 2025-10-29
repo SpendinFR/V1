@@ -21,7 +21,6 @@ from AGI_Evolutive.core.question_manager import QuestionManager
 from AGI_Evolutive.creativity import CreativitySystem
 from AGI_Evolutive.emotions import EmotionalSystem
 from AGI_Evolutive.goals import GoalSystem, GoalType
-from AGI_Evolutive.goals.dag_store import GoalDAG
 from AGI_Evolutive.io.action_interface import ActionInterface
 from AGI_Evolutive.io.perception_interface import PerceptionInterface
 from AGI_Evolutive.language.understanding import SemanticUnderstanding
@@ -83,8 +82,6 @@ class CognitiveArchitecture:
         self.intent_model = IntentModel()
         self.question_manager = QuestionManager(self)
         self._last_intent_decay = time.time()
-        self.goal_dag = GoalDAG("runtime/goal_dag.json")
-
         # Global state
         self.global_activation = 0.5
         self.start_time = time.time()
@@ -759,6 +756,15 @@ class CognitiveArchitecture:
 
     # ------------------------------------------------------------------
     # Status & reporting
+    def _goal_focus_snapshot(self) -> Dict[str, Any]:
+        goal_system = getattr(self, "goals", None)
+        if not goal_system:
+            return {"id": None, "evi": 0.0, "progress": 0.0}
+        try:
+            return goal_system.store.choose_next_goal()
+        except Exception:
+            return {"id": None, "evi": 0.0, "progress": 0.0}
+
     def _present_subsystems(self) -> Dict[str, bool]:
         names = [
             "memory",
@@ -789,7 +795,7 @@ class CognitiveArchitecture:
             "working_memory_load": float(wm_load),
             "subsystems": self._present_subsystems(),
             "style_policy": self.style_policy.as_dict(),
-            "goal_focus": self.goal_dag.choose_next_goal(),
+            "goal_focus": self._goal_focus_snapshot(),
         }
 
     def diagnostic_snapshot(self, tail: int = 30) -> Dict[str, Any]:
@@ -1437,6 +1443,13 @@ class CognitiveArchitecture:
             output_payload["diagnostics_text"] = diagnostics_text
 
         self._tick_background_systems()
+        try:
+            event_payload: Dict[str, Any] = {"reply": user_reply}
+            if user_msg:
+                event_payload["user_msg"] = user_msg
+            self._notify_scheduler("user_cycle", event_payload)
+        except Exception:
+            pass
         return output_payload
 
     def _handle_abduction_request(self, user_msg: str) -> Dict[str, Any]:
@@ -2122,17 +2135,29 @@ class CognitiveArchitecture:
             pass
 
     def _tick_background_systems(self) -> None:
+        job_events = 0
         try:
             if getattr(self, "jobs", None):
-                self.jobs.drain_to_memory(self.memory)
+                job_events = self.jobs.drain_to_memory(self.memory)
         except Exception:
-            pass
+            job_events = 0
+        if job_events:
+            try:
+                self._notify_scheduler("job_event", {"count": int(job_events)})
+            except Exception:
+                pass
 
+        inbox_added: List[str] = []
         try:
             if self.perception_interface:
-                self.perception_interface.step()
+                inbox_added = self.perception_interface.step()
         except Exception:
-            pass
+            inbox_added = []
+        if inbox_added:
+            try:
+                self._notify_scheduler("inbox_update", {"files": list(inbox_added)})
+            except Exception:
+                pass
 
         try:
             if self.emotions and hasattr(self.emotions, "step"):
@@ -2178,6 +2203,15 @@ class CognitiveArchitecture:
                         "assistant_msg": self.last_output_text,
                     },
                 )
+        except Exception:
+            pass
+
+    def _notify_scheduler(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        scheduler = getattr(self, "scheduler", None)
+        if not scheduler or not hasattr(scheduler, "notify"):
+            return
+        try:
+            scheduler.notify(event, payload=payload)
         except Exception:
             pass
 

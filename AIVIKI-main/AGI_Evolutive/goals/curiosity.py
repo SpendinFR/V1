@@ -6,9 +6,11 @@ import logging
 import math
 import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from .dag_store import normalize_goal_signature
 
 
 LOGGER = logging.getLogger(__name__)
@@ -181,7 +183,10 @@ class CuriosityEngine:
         self._weight_model = OnlineLinear(len(self._feature_order))
         self._bandit = DiscreteThompsonSampler(self._BANDIT_PRESETS, self._rng)
         self._pending_proposals: List[Dict[str, Any]] = []
+        self._pending_signature_set: Set[str] = set()
         self._goal_memory: Dict[str, Dict[str, Any]] = {}
+        self._goal_index: Dict[str, str] = {}
+        self._known_signatures: Set[str] = set()
         self._explore_rate = 0.2
 
     # ------------------------------------------------------------------
@@ -306,6 +311,8 @@ class CuriosityEngine:
 
             proposal = self._build_goal_from_gap(gap, parent_goal, weights)
             signature = self._proposal_signature(proposal)
+            if signature in self._pending_signature_set or signature in self._known_signatures:
+                continue
             self._pending_proposals.append(
                 {
                     "signature": signature,
@@ -315,43 +322,98 @@ class CuriosityEngine:
                     "weights": dict(weights),
                 }
             )
+            self._pending_signature_set.add(signature)
             proposals.append(proposal)
 
         random.shuffle(proposals)
         return proposals[:k]
 
     # ------------------------------------------------------------------
+    def is_signature_known(self, signature: str) -> bool:
+        return signature in self._known_signatures
+
+    def mark_signature(self, signature: str) -> None:
+        if not signature:
+            return
+        if signature not in self._known_signatures:
+            self._known_signatures.add(signature)
+        if signature in self._pending_signature_set:
+            self._pending_signature_set.discard(signature)
+            self._pending_proposals = [
+                entry
+                for entry in self._pending_proposals
+                if entry.get("signature") != signature
+            ]
+
+    # ------------------------------------------------------------------
     def register_proposal(self, goal_id: str, proposal: Dict[str, Any]) -> None:
         signature = self._proposal_signature(proposal)
+        pending_record: Optional[Dict[str, Any]] = None
         for idx, pending in enumerate(self._pending_proposals):
             if pending.get("signature") == signature:
-                record = dict(pending)
-                record["goal_id"] = goal_id
+                pending_record = dict(pending)
                 self._pending_proposals.pop(idx)
-                self._goal_memory[goal_id] = record
-                self._prune_goal_memory()
                 break
+        self._pending_signature_set.discard(signature)
+        entry = self._goal_memory.get(signature)
+        if not entry:
+            base_features = list(pending_record.get("features", [])) if pending_record else [0.0] * len(self._feature_order)
+            entry = {
+                "signature": signature,
+                "features": base_features,
+                "arm": pending_record.get("arm") if pending_record else None,
+                "gap": dict(pending_record.get("gap", {})) if pending_record else {},
+                "weights": dict(pending_record.get("weights", {})) if pending_record else {},
+                "goal_ids": set(),
+                "count": 0,
+            }
+            self._goal_memory[signature] = entry
+        else:
+            if pending_record:
+                entry.setdefault("features", pending_record.get("features", entry.get("features", [])))
+                if pending_record.get("arm"):
+                    entry["arm"] = pending_record["arm"]
+                if pending_record.get("gap"):
+                    entry["gap"] = dict(pending_record["gap"])
+                if pending_record.get("weights"):
+                    entry["weights"] = dict(pending_record["weights"])
+        entry.setdefault("goal_ids", set()).add(goal_id)
+        entry["count"] = entry.get("count", 0) + 1
+        entry["last_seen"] = time.time()
+        self._goal_index[goal_id] = signature
+        self.mark_signature(signature)
+        self._prune_goal_memory()
 
     def observe_goal_feedback(self, goal_id: str, message: str) -> None:
         reward = self._analyze_feedback_text(message)
         if reward is None:
             return
-        entry = self._goal_memory.get(goal_id)
+        signature = self._goal_index.get(goal_id)
+        if not signature:
+            return
+        entry = self._goal_memory.get(signature)
         if not entry:
             return
         self._weight_model.update(entry["features"], reward)
-        self._bandit.update(entry["arm"], reward)
+        arm = entry.get("arm")
+        if arm:
+            self._bandit.update(arm, reward)
         entry["last_reward"] = reward
 
     def observe_goal_outcome(self, goal_id: str, success: bool, confidence: float = 1.0) -> None:
-        entry = self._goal_memory.get(goal_id)
+        signature = self._goal_index.get(goal_id)
+        if not signature:
+            return
+        entry = self._goal_memory.get(signature)
         if not entry:
             return
         confidence = max(0.0, min(1.0, confidence))
         reward = 0.5 + (0.5 if success else -0.5) * confidence
         reward = max(0.0, min(1.0, reward))
         self._weight_model.update(entry["features"], reward)
-        self._bandit.update(entry["arm"], reward)
+        arm = entry.get("arm")
+        if arm:
+            self._bandit.update(arm, reward)
         entry["last_reward"] = reward
 
     # ------------------------------------------------------------------
@@ -691,22 +753,26 @@ class CuriosityEngine:
         }
 
     def _proposal_signature(self, proposal: Dict[str, Any]) -> str:
-        criteria = tuple(proposal.get("criteria", []))
-        payload = (
+        return normalize_goal_signature(
             proposal.get("description", ""),
-            criteria,
-            round(float(proposal.get("value", 0.0)), 2),
-            round(float(proposal.get("competence", 0.0)), 2),
-            round(float(proposal.get("curiosity", 0.0)), 2),
-            round(float(proposal.get("urgency", 0.0)), 2),
+            proposal.get("criteria"),
+            proposal.get("parent_ids"),
         )
-        return repr(payload)
 
     def _prune_goal_memory(self) -> None:
         if len(self._goal_memory) <= 200:
             return
-        for goal_id in list(sorted(self._goal_memory.keys()))[: len(self._goal_memory) - 200]:
-            self._goal_memory.pop(goal_id, None)
+        overflow = len(self._goal_memory) - 200
+        ordered = sorted(
+            self._goal_memory.items(), key=lambda kv: kv[1].get("last_seen", 0.0)
+        )
+        for signature, entry in ordered[:overflow]:
+            removed = self._goal_memory.pop(signature, None)
+            if not removed:
+                continue
+            goal_ids = removed.get("goal_ids", set())
+            for gid in list(goal_ids):
+                self._goal_index.pop(gid, None)
 
     def _analyze_feedback_text(self, message: str) -> Optional[float]:
         tokens = re.findall(r"[\w']+", message.lower())

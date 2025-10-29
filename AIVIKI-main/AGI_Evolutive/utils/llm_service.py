@@ -189,13 +189,9 @@ def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
                         thread_label,
                     )
                 _CALL_CONDITION.wait(timeout=0.2)
-            acquired = True
         finally:
-            if is_urgent and not acquired:
+            if is_urgent:
                 _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
-
-        if is_urgent:
-            _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
 
         if wait_started is not None:
             LOGGER.info(
@@ -256,8 +252,6 @@ def _await_urgent_clearance(
     wait_started: Optional[float] = None
 
     while True:
-        if _current_thread_is_urgent():
-            break
         active = _is_global_urgent_active()
         if not active and _URGENT_ACTIVE_CHECK is not None:
             try:
