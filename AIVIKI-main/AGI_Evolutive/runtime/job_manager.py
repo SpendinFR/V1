@@ -2,13 +2,50 @@
 # idempotence, progrès, persistance JSONL, drain des complétions côté thread principal).
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Set
+from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Set, Iterable
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
 
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+_THREAD_CONTEXT = threading.local()
+
+
+def _push_thread_tokens(ctx_id: str, tokens: Iterable[str]) -> None:
+    token_set = {t for t in tokens if t}
+    if not token_set:
+        return
+    stack: List[Tuple[str, Set[str]]] = getattr(_THREAD_CONTEXT, "stack", [])
+    stack.append((ctx_id, token_set))
+    _THREAD_CONTEXT.stack = stack
+
+
+def _pop_thread_tokens(ctx_id: str) -> None:
+    stack: List[Tuple[str, Set[str]]] = getattr(_THREAD_CONTEXT, "stack", [])
+    if not stack:
+        return
+    for idx in range(len(stack) - 1, -1, -1):
+        if stack[idx][0] == ctx_id:
+            stack.pop(idx)
+            break
+    if stack:
+        _THREAD_CONTEXT.stack = stack
+    else:
+        try:
+            delattr(_THREAD_CONTEXT, "stack")
+        except AttributeError:
+            pass
+
+
+def _current_thread_tokens() -> Set[str]:
+    stack: List[Tuple[str, Set[str]]] = getattr(_THREAD_CONTEXT, "stack", [])
+    tokens: Set[str] = set()
+    for _, subset in stack:
+        tokens.update(subset)
+    return tokens
 
 
 def _now() -> float:
@@ -161,6 +198,8 @@ class JobManager:
         self._priority_model = _OnlinePriorityModel()
         self._urgent_jobs: Set[str] = set()
         self._urgent_token_counts: Dict[str, int] = collections.defaultdict(int)
+        self._manual_urgent_counts: Dict[str, int] = collections.defaultdict(int)
+        self._urgent_contexts: Dict[str, Set[str]] = {}
 
         # budgets (ajuste si besoin)
         self.budgets = {
@@ -182,6 +221,16 @@ class JobManager:
         self._alive = True
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
+
+        try:
+            from AGI_Evolutive.utils import llm_service
+
+            llm_service.register_urgent_gate(
+                check_active=self.has_active_urgent_chain,
+                allow_current=self.current_thread_has_urgent_permission,
+            )
+        except Exception:
+            pass
 
     def _current_focus_topic(self) -> Optional[str]:
         arch = getattr(self, "arch", None)
@@ -609,12 +658,16 @@ class JobManager:
             self._start_job(j)
             ctx = JobContext(self, j.id)
             ok, result, err, tr = True, None, None, None
+            thread_ctx_id = f"job:{j.id}"
+            _push_thread_tokens(thread_ctx_id, j.priority_tokens or set())
             try:
                 # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
                 result = j.fn(ctx, j.args or {})
             except Exception as e:
                 ok, err = False, str(e)
                 tr = traceback.format_exc()
+            finally:
+                _pop_thread_tokens(thread_ctx_id)
             # cancellation après exécution ?
             if self._is_cancelled(j.id) and ok:
                 ok, err = False, "cancelled"
@@ -694,6 +747,8 @@ class JobManager:
         with self._lock:
             if any(count > 0 for count in self._urgent_token_counts.values()):
                 return True
+            if any(count > 0 for count in self._manual_urgent_counts.values()):
+                return True
             for job_id in list(self._urgent_jobs):
                 job = self._jobs.get(job_id)
                 if not job:
@@ -701,6 +756,47 @@ class JobManager:
                 if job.status in {"queued", "running"} and job.priority_tokens.intersection(urgent_types):
                     return True
         return False
+
+    def current_thread_has_urgent_permission(self) -> bool:
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        return any(token in urgent_types for token in _current_thread_tokens())
+
+    def activate_urgent_context(self, tokens: Iterable[str]) -> Optional[str]:
+        """Force une fenêtre d'urgence tant que les jobs dérivés ne sont pas soumis."""
+
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        normalized: Set[str] = set()
+        for tok in tokens:
+            if not isinstance(tok, str):
+                continue
+            token = tok.strip().upper()
+            if token and token in urgent_types:
+                normalized.add(token)
+        if not normalized:
+            return None
+        ctx_id = str(uuid.uuid4())
+        with self._lock:
+            self._urgent_contexts[ctx_id] = set(normalized)
+            for token in normalized:
+                self._manual_urgent_counts[token] += 1
+        _push_thread_tokens(ctx_id, normalized)
+        return ctx_id
+
+    def deactivate_urgent_context(self, ctx_id: Optional[str]) -> None:
+        if not ctx_id:
+            return
+        with self._lock:
+            tokens = self._urgent_contexts.pop(ctx_id, None)
+            if not tokens:
+                _pop_thread_tokens(ctx_id)
+                return
+            for token in tokens:
+                count = self._manual_urgent_counts.get(token, 0)
+                if count <= 1:
+                    self._manual_urgent_counts.pop(token, None)
+                else:
+                    self._manual_urgent_counts[token] = count - 1
+        _pop_thread_tokens(ctx_id)
 
     def _extract_priority_tokens(
         self, args: Dict[str, Any]

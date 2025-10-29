@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from contextlib import nullcontext
 from types import SimpleNamespace
 from collections import deque, defaultdict
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Mapping
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Mapping, Set
 
 try:  # pragma: no cover - platform specific import
     import resource as _resource
@@ -2652,7 +2652,7 @@ class Orchestrator:
         result["meta"] = args.get("meta", {})
         return result
 
-    def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+    def _run_pipeline_inner(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:
@@ -3667,6 +3667,35 @@ class Orchestrator:
             except Exception:
                 pass
         return ctx
+
+    def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        job_manager = getattr(self, "job_manager", None)
+        urgent_types = {TriggerType.SIGNAL, TriggerType.THREAT, TriggerType.NEED}
+        trigger_meta = trigger.meta or {}
+        tokens: Set[str] = set()
+        if trigger.type in urgent_types:
+            tokens.add(trigger.type.name)
+        chain = trigger_meta.get("priority_chain")
+        if isinstance(chain, (list, tuple, set)):
+            for item in chain:
+                if isinstance(item, str):
+                    token = item.strip().upper()
+                    if token:
+                        tokens.add(token)
+        ctx_id: Optional[str] = None
+        if job_manager and hasattr(job_manager, "activate_urgent_context"):
+            try:
+                ctx_id = job_manager.activate_urgent_context(tokens)
+            except Exception:
+                ctx_id = None
+        try:
+            return self._run_pipeline_inner(trigger)
+        finally:
+            if job_manager and hasattr(job_manager, "deactivate_urgent_context"):
+                try:
+                    job_manager.deactivate_urgent_context(ctx_id)
+                except Exception:
+                    pass
 
     def _phenomenal_identity_snapshot(self) -> Tuple[List[str], List[str]]:
         values: List[str] = []
