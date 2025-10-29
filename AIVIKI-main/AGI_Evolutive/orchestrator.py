@@ -2262,6 +2262,13 @@ class Orchestrator:
         jm = getattr(self, "job_manager", None)
         with ExitStack() as cycle_stack:
             cycle_ctx_id: Optional[str] = None
+            if user_msg:
+                try:
+                    manual_urgent_enter()
+                except Exception:
+                    pass
+                else:
+                    cycle_stack.callback(manual_urgent_exit)
             if user_msg and jm and hasattr(jm, "activate_urgent_context"):
                 try:
                     cycle_ctx_id = jm.activate_urgent_context(["SIGNAL"])
