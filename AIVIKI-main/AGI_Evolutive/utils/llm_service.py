@@ -390,6 +390,16 @@ def try_call_llm_dict(
             call_duration,
             thread_label,
         )
+        now = time.time()
+        total_duration = now - request_ts
+        call_duration = now - call_started_at
+        LOGGER.info(
+            "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+            spec_key,
+            total_duration,
+            call_duration,
+            thread_label,
+        )
         _record_activity(spec_key, "success", None)
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:

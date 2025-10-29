@@ -515,6 +515,7 @@ class SemanticUnderstanding:
     # ---------- INTENT & ACTS ----------
     def _classify_intent(self, text: str, norm: Optional[str] = None, canonical: Optional[str] = None) -> Tuple[str, float]:
         norm_text = norm if norm is not None else _normalize(text or "")
+        canonical_text = canonical if canonical is not None else _canonicalize(text or "")
 
         if self.intent_model and hasattr(self.intent_model, "predict"):
             try:
@@ -523,8 +524,42 @@ class SemanticUnderstanding:
             except Exception:
                 pass
 
+        llm_intent: Optional[str] = None
+        llm_conf = 0.0
+        if _llm_enabled() and text:
+            payload = {
+                "utterance": text,
+                "normalized": norm_text,
+                "canonical": canonical_text,
+            }
+            try:
+                response = _llm_manager().call_dict(
+                    "language_intent_detection",
+                    input_payload=payload,
+                )
+            except (LLMUnavailableError, LLMIntegrationError):
+                response = None
+            if isinstance(response, Mapping):
+                extracted_intent = response.get("intent")
+                if isinstance(extracted_intent, str):
+                    llm_intent = extracted_intent.strip()
+                llm_conf = _safe_float(
+                    response.get("confidence", response.get("confidence_score", 0.0)),
+                    0.0,
+                )
+
         base_intent, base_conf = IntentModel.rule_predict(norm_text)
         fallback_intent, fallback_conf = self.intent_classifier.predict(text)
+
+        if llm_intent:
+            effective_conf = llm_conf if llm_conf > 0.0 else 0.6
+            if (
+                effective_conf > base_conf + 0.05
+                or (base_conf < self.min_intent_conf and effective_conf >= 0.45)
+                or (fallback_conf < self.min_intent_conf and effective_conf >= fallback_conf)
+            ):
+                combined = max(base_conf, fallback_conf, effective_conf)
+                return llm_intent, min(0.99, combined)
 
         if fallback_intent and (fallback_conf > base_conf + 0.05 or (base_conf < self.min_intent_conf and fallback_conf >= base_conf)):
             return fallback_intent, min(0.99, max(base_conf, fallback_conf))

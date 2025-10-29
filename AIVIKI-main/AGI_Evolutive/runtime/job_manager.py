@@ -103,6 +103,11 @@ class JobContext:
     def cancelled(self) -> bool:
         return self._jm._is_cancelled(self._job_id)
 
+    def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
+        """Bloque si une chaîne urgente est active (pour jobs coopératifs)."""
+
+        return self._jm.pause_if_urgent_active(timeout=timeout)
+
 
 class _OnlinePriorityModel:
     """Petit modèle logistique online pour ajuster les priorités."""
@@ -653,6 +658,10 @@ class JobManager:
                 continue
             with self._lock:
                 j = self._jobs.get(jid)
+                if j and lane == "background" and self._should_defer_background_locked():
+                    self._push_pq(j)
+                    self._condition.notify_all()
+                    continue
             if not j:
                 with self._condition:
                     self._condition.notify_all()
