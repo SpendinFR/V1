@@ -843,6 +843,45 @@ class Scheduler:
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
+    def _rebuild_schedule(self) -> None:
+        """Rebuild the internal priority queue of periodic tasks.
+
+        Earlier versions of the scheduler dynamically populated
+        ``self._schedule`` when tasks were registered, but they never
+        re-synchronised it with the persisted state on start-up.  The
+        ``start`` method still calls :meth:`_rebuild_schedule`, yet the
+        helper was accidentally dropped during a refactor which left the
+        attribute access dangling.  Re-introducing the method keeps the
+        behaviour consistent with the previous implementation and avoids an
+        ``AttributeError`` during initialisation.
+        """
+
+        now = _now()
+        with self._cond:
+            self._schedule.clear()
+            for name, cfg in self.tasks.items():
+                policy: Optional[AdaptiveTaskPolicy] = cfg.get("policy")
+                interval = 0.0
+                if policy is not None:
+                    interval = float(max(0.0, policy.current_interval))
+                else:
+                    interval = float(max(0.0, cfg.get("interval", 0.0)))
+                base_interval = float(max(interval, cfg.get("base_interval", interval)))
+                if interval <= 0.0:
+                    interval = base_interval
+
+                last_run = float(self.state["last_runs"].get(name, 0.0))
+                due = last_run + interval if last_run > 0.0 else now
+                if due < now:
+                    due = now
+
+                jitter = float(cfg.get("jitter", 0.0))
+                if jitter > 0.0:
+                    due += random.uniform(0.0, jitter)
+
+                heapq.heappush(self._schedule, (due, name))
+            self._cond.notify_all()
+
     def stop(self):
         self.running = False
         with self._condition:
