@@ -103,6 +103,11 @@ class JobContext:
     def cancelled(self) -> bool:
         return self._jm._is_cancelled(self._job_id)
 
+    def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
+        """Bloque si une chaîne urgente est active (pour jobs coopératifs)."""
+
+        return self._jm.pause_if_urgent_active(timeout=timeout)
+
 
 class _OnlinePriorityModel:
     """Petit modèle logistique online pour ajuster les priorités."""
@@ -446,13 +451,14 @@ class JobManager:
     def _select_next_job_locked(self) -> Tuple[Optional[str], Optional[str]]:
         lane_item: Optional[Tuple[str, _PQItem]] = None
         urgent_active = any(count > 0 for count in self._urgent_token_counts.values())
+        urgent_interactive_pending = self._has_pending_urgent_interactive_locked()
         if self._pq_inter:
             lane_item = ("interactive", self._pq_inter[0])
         if self._pq_back:
             back_item = self._pq_back[0]
             if lane_item is None:
                 lane_item = ("background", back_item)
-            elif not urgent_active:
+            elif not (urgent_active or urgent_interactive_pending):
                 current_lane, current_item = lane_item
                 current_prio = -float(current_item.neg_prio)
                 back_prio = -float(back_item.neg_prio)
@@ -482,6 +488,25 @@ class JobManager:
                     return lane, jid
                 self._condition.wait(timeout=0.1)
             return None, None
+
+    def _has_pending_urgent_interactive_locked(self) -> bool:
+        if not self._pq_inter:
+            return False
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        for item in self._pq_inter:
+            job = self._jobs.get(item.job_id)
+            if job and job.priority_tokens and job.priority_tokens.intersection(urgent_types):
+                return True
+        return False
+
+    def _should_defer_background_locked(self) -> bool:
+        if not self._pq_inter:
+            return False
+        if self._has_pending_urgent_interactive_locked():
+            return True
+        if self._urgent_state:
+            return True
+        return False
 
     def _compute_reward(self, j: Job) -> Tuple[float, float]:
         finished = j.finished_ts or _now()
@@ -653,6 +678,10 @@ class JobManager:
                 continue
             with self._lock:
                 j = self._jobs.get(jid)
+                if j and lane == "background" and self._should_defer_background_locked():
+                    self._push_pq(j)
+                    self._condition.notify_all()
+                    continue
             if not j:
                 with self._condition:
                     self._condition.notify_all()
