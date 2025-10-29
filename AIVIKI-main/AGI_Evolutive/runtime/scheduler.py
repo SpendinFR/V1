@@ -287,6 +287,7 @@ class Scheduler:
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._schedule: List[Tuple[float, str]] = []
+        self._delayed_timers: Dict[str, Dict[str, Any]] = {}
 
         reflection_state = self.state["models"].get("reflection", {})
         self._reflection_model = OnlineLogistic(
@@ -746,14 +747,39 @@ class Scheduler:
             delay_val = 0.1
 
         payload_copy = dict(payload)
+        run_at = _now() + delay_val
 
         def _emit_later() -> None:
             with self._condition:
-                self._event_queue.append((event, payload_copy))
-                self._condition.notify_all()
+                entry = self._delayed_timers.get(event)
+                if entry and entry.get("timer") is timer:
+                    payload_to_emit = dict(entry.get("payload") or payload_copy)
+                    self._delayed_timers.pop(event, None)
+                    self._event_queue.append((event, payload_to_emit))
+                    self._condition.notify_all()
 
         timer = threading.Timer(delay_val, _emit_later)
         timer.daemon = True
+        with self._condition:
+            entry = self._delayed_timers.get(event)
+            if entry is not None:
+                existing_timer = entry.get("timer") if isinstance(entry, dict) else None
+                scheduled_for = float(entry.get("run_at", 0.0)) if isinstance(entry, dict) else 0.0
+                if scheduled_for <= run_at:
+                    if isinstance(entry, dict):
+                        entry["payload"] = payload_copy
+                    return
+                if isinstance(existing_timer, threading.Timer):
+                    try:
+                        existing_timer.cancel()
+                    except Exception:
+                        pass
+            self._delayed_timers[event] = {
+                "timer": timer,
+                "run_at": run_at,
+                "payload": payload_copy,
+            }
+
         timer.start()
 
     def _run_task(
@@ -847,6 +873,14 @@ class Scheduler:
         self.running = False
         with self._condition:
             self._condition.notify_all()
+            for entry in list(self._delayed_timers.values()):
+                timer = entry.get("timer") if isinstance(entry, dict) else None
+                if isinstance(timer, threading.Timer):
+                    try:
+                        timer.cancel()
+                    except Exception:
+                        pass
+            self._delayed_timers.clear()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
 

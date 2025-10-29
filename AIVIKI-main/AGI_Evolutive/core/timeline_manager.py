@@ -218,7 +218,7 @@ class TimelineManager:
         journal.append(event)
         if len(journal) >= journal.maxlen:
             self._compact_topic_journal(topic)
-        if self.memory is not None and event["kind"] == "belief_snapshot":
+        if self.memory is not None and event.get("kind") in {"belief_snapshot", "belief_delta"}:
             self.memory.add(event)
         if event["kind"] == "belief_snapshot":
             self._last_state[topic] = {b.get("stmt"): deepcopy(b) for b in event.get("beliefs", [])}
