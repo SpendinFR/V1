@@ -632,7 +632,6 @@ class Scheduler:
     def _loop(self):
         while self.running and self.state.get("enabled", True):
             if self._should_pause_for_urgent_chain():
-                time.sleep(0.2)
                 continue
             now = _now()
             for name, cfg in self.tasks.items():
@@ -682,19 +681,41 @@ class Scheduler:
 
     def _should_pause_for_urgent_chain(self) -> bool:
         jm = self._resolve_job_manager()
-        if jm and hasattr(jm, "has_active_urgent_chain"):
+        if not jm:
+            if self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler resume: urgent chain cleared")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = False
+            return False
+
+        paused = False
+        used_wait_api = False
+        if hasattr(jm, "pause_if_urgent_active"):
             try:
-                active = bool(jm.has_active_urgent_chain())
+                paused = bool(jm.pause_if_urgent_active(timeout=0.2))
+                used_wait_api = True
             except Exception:
-                active = False
-            if active:
-                if not self._urgent_pause_logged:
-                    try:
-                        logger.info("Scheduler pause: urgent job chain active")
-                    except Exception:
-                        pass
-                    self._urgent_pause_logged = True
-                return True
+                paused = False
+                used_wait_api = False
+        if not used_wait_api and hasattr(jm, "has_active_urgent_chain"):
+            try:
+                paused = bool(jm.has_active_urgent_chain())
+            except Exception:
+                paused = False
+            if paused:
+                time.sleep(0.2)
+
+        if paused:
+            if not self._urgent_pause_logged:
+                try:
+                    logger.info("Scheduler pause: urgent job chain active")
+                except Exception:
+                    pass
+                self._urgent_pause_logged = True
+            return True
+
         if self._urgent_pause_logged:
             try:
                 logger.info("Scheduler resume: urgent chain cleared")

@@ -200,6 +200,8 @@ class JobManager:
         self._urgent_token_counts: Dict[str, int] = collections.defaultdict(int)
         self._manual_urgent_counts: Dict[str, int] = collections.defaultdict(int)
         self._urgent_contexts: Dict[str, Set[str]] = {}
+        self._urgent_state: bool = False
+        self._urgent_condition = threading.Condition(self._lock)
 
         # budgets (ajuste si besoin)
         self.budgets = {
@@ -743,19 +745,40 @@ class JobManager:
     def has_active_urgent_chain(self) -> bool:
         """Indique si une chaîne prioritaire (SIGNAL/THREAT/NEED) est active."""
 
-        urgent_types = {"SIGNAL", "THREAT", "NEED"}
         with self._lock:
-            if any(count > 0 for count in self._urgent_token_counts.values()):
+            active = self._compute_urgent_state_locked()
+            self._set_urgent_state_locked(active)
+            return active
+
+    def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
+        """Bloque brièvement l'appelant si une chaîne urgente est active."""
+
+        with self._urgent_condition:
+            if not self._urgent_state:
+                return False
+            self._urgent_condition.wait(timeout)
+            return True
+
+    def _compute_urgent_state_locked(self) -> bool:
+        urgent_types = {"SIGNAL", "THREAT", "NEED"}
+        if any(count > 0 for count in self._urgent_token_counts.values()):
+            return True
+        if any(count > 0 for count in self._manual_urgent_counts.values()):
+            return True
+        for job_id in list(self._urgent_jobs):
+            job = self._jobs.get(job_id)
+            if not job:
+                continue
+            if job.status in {"queued", "running"} and job.priority_tokens.intersection(urgent_types):
                 return True
-            if any(count > 0 for count in self._manual_urgent_counts.values()):
-                return True
-            for job_id in list(self._urgent_jobs):
-                job = self._jobs.get(job_id)
-                if not job:
-                    continue
-                if job.status in {"queued", "running"} and job.priority_tokens.intersection(urgent_types):
-                    return True
         return False
+
+    def _set_urgent_state_locked(self, active: bool) -> None:
+        changed = active != self._urgent_state
+        self._urgent_state = active
+        if changed or active:
+            # Toujours notifier les threads en attente pour réduire la latence.
+            self._urgent_condition.notify_all()
 
     def current_thread_has_urgent_permission(self) -> bool:
         urgent_types = {"SIGNAL", "THREAT", "NEED"}
@@ -779,6 +802,7 @@ class JobManager:
             self._urgent_contexts[ctx_id] = set(normalized)
             for token in normalized:
                 self._manual_urgent_counts[token] += 1
+            self._set_urgent_state_locked(True)
         _push_thread_tokens(ctx_id, normalized)
         return ctx_id
 
@@ -796,6 +820,7 @@ class JobManager:
                     self._manual_urgent_counts.pop(token, None)
                 else:
                     self._manual_urgent_counts[token] = count - 1
+            self._set_urgent_state_locked(self._compute_urgent_state_locked())
         _pop_thread_tokens(ctx_id)
 
     def _extract_priority_tokens(
@@ -856,9 +881,11 @@ class JobManager:
         if urgent_tokens:
             overrides = job.metrics.setdefault("overrides", {})
             overrides["urgent_tokens"] = sorted(urgent_tokens)
-            self._urgent_jobs.add(job.id)
-            for tok in urgent_tokens:
-                self._urgent_token_counts[tok] += 1
+            with self._lock:
+                self._urgent_jobs.add(job.id)
+                for tok in urgent_tokens:
+                    self._urgent_token_counts[tok] += 1
+                self._set_urgent_state_locked(True)
 
     def _release_priority_tokens(self, job: Job) -> None:
         urgent_types = {"SIGNAL", "THREAT", "NEED"}
@@ -873,6 +900,7 @@ class JobManager:
                     self._urgent_token_counts.pop(tok, None)
                 else:
                     self._urgent_token_counts[tok] = count - 1
+            self._set_urgent_state_locked(self._compute_urgent_state_locked())
         job.priority_tokens.clear()
 
     def _should_force_interactive(self, args: Dict[str, Any]) -> Optional[str]:

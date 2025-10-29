@@ -1108,6 +1108,11 @@ class Orchestrator:
             job_manager = existing_jobs
 
         self.job_manager = job_manager
+        try:
+            setattr(self.arch, "jobs", job_manager)
+            setattr(self.arch, "job_manager", job_manager)
+        except Exception:
+            pass
         self._phenomenal_kernel = PhenomenalKernel()
         self.phenomenal_journal = getattr(self, "phenomenal_journal", None) or PhenomenalJournal()
         self.phenomenal_recall = getattr(self, "phenomenal_recall", None) or PhenomenalRecall(
@@ -1205,6 +1210,13 @@ class Orchestrator:
                 skills=getattr(self.arch, "skill_sandbox", None),
                 job_bases=self._job_base_budgets,
             )
+        try:
+            self._action_interface.bind(
+                jobs=job_manager,
+                job_bases=self._job_base_budgets,
+            )
+        except Exception:
+            pass
         self._perception_interface = PerceptionInterface(self._memory_store)
         self.curiosity = CuriosityEngine(architecture=self.arch)
 
@@ -2209,13 +2221,27 @@ class Orchestrator:
         except Exception:
             pass
 
-        if not self.job_manager.has_active_urgent_chain():
-            self.scheduler.tick()
-        else:
+        cycle_ctx_id: Optional[str] = None
+        jm = getattr(self, "job_manager", None)
+        if user_msg and jm and hasattr(jm, "activate_urgent_context"):
             try:
-                logger.debug("Skip scheduler tick: urgent chain active")
+                cycle_ctx_id = jm.activate_urgent_context(["SIGNAL"])
             except Exception:
-                pass
+                cycle_ctx_id = None
+        try:
+            if not jm or not hasattr(jm, "has_active_urgent_chain") or not jm.has_active_urgent_chain():
+                self.scheduler.tick()
+            else:
+                try:
+                    logger.debug("Skip scheduler tick: urgent chain active")
+                except Exception:
+                    pass
+        finally:
+            if cycle_ctx_id and hasattr(jm, "deactivate_urgent_context"):
+                try:
+                    jm.deactivate_urgent_context(cycle_ctx_id)
+                except Exception:
+                    pass
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
