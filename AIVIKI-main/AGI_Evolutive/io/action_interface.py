@@ -1074,6 +1074,10 @@ class ActionInterface:
                     act.result = {"ok": False, "reason": reason or "policy_rejected"}
                     self._log(act)
                     self._memorize_action(act)
+                    try:
+                        self._notify_action_event(act)
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass
@@ -1175,6 +1179,10 @@ class ActionInterface:
         self._update_learning_signals(act, reward)
         self._log(act, reward=reward)
         self._memorize_action(act, reward=reward)
+        try:
+            self._notify_action_event(act)
+        except Exception:
+            pass
 
     def _builtin_handlers(self) -> Dict[str, Callable[[Action], Dict[str, Any]]]:
         return {

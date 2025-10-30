@@ -189,6 +189,16 @@ class Autopilot:
         # 1) Integrate any freshly dropped documents.
         ingest_result = self._run_stage("ingest", self.ingest.integrate)
         metrics["stages"]["ingest"] = ingest_result.to_metrics()
+        if ingest_result.ok and ingest_result.payload:
+            try:
+                added_count = int(ingest_result.payload)
+            except Exception:
+                added_count = 0
+            if added_count:
+                try:
+                    self.arch._notify_scheduler("inbox_update", {"count": added_count})
+                except Exception:
+                    pass
 
         # 2) Execute one cognitive cycle.
         cycle_result = self._run_stage(
@@ -198,7 +208,6 @@ class Autopilot:
         )
         metrics["stages"]["cycle"] = cycle_result.to_metrics()
         out = cycle_result.payload if cycle_result.ok else None
-
         if cycle_result.ok and not self._cycle_payload_has_text(out):
             details = self._describe_cycle_payload(out)
             error_result = StageResult(
