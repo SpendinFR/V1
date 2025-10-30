@@ -7,7 +7,7 @@ import random
 import time
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import is_urgent_mode_active, try_call_llm_dict
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,10 @@ class LightScheduler:
             "exec_count": job.get("exec_count"),
             "total_duration": job.get("total_duration"),
         }
+        if is_urgent_mode_active():
+            logger.debug("Skip LLM spec 'light_scheduler' (urgent chain active)")
+            return
+
         response = try_call_llm_dict(
             "light_scheduler",
             input_payload=payload,

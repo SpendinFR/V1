@@ -4,12 +4,13 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import should_defer_background_llm, try_call_llm_dict
 
 
 class SemanticMemoryBridge:
@@ -105,6 +106,18 @@ class SemanticMemoryBridge:
                     for item in memories
                 ]
             }
+            if should_defer_background_llm():
+                for item in memories:
+                    try:
+                        self._queue.put_nowait(item)
+                    except queue.Full:
+                        LOGGER.debug(
+                            "Semantic bridge backlog full while deferring urgent chain"
+                        )
+                        break
+                time.sleep(self._idle_sleep)
+                return
+
             llm_response = try_call_llm_dict(
                 "memory_semantic_bridge",
                 input_payload=llm_payload,
