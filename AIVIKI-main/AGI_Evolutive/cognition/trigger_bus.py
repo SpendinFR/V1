@@ -6,6 +6,7 @@ import math
 import random
 import time
 
+from AGI_Evolutive.core.session_context import get_current_session
 from AGI_Evolutive.core.trigger_types import Trigger, TriggerType
 from AGI_Evolutive.core.evaluation import (
     get_last_priority_token,
@@ -104,7 +105,7 @@ class TriggerBus:
 
     def __init__(self):
         self.collectors: List[Collector] = []
-        self.cooldown_cache: Dict[str, float] = {}  # simple dedup/cooldown
+        self.cooldown_cache: Dict[str, float] = {}  # fallback when no session context
         self._habit_strength_source: Optional[Any] = None
         self._adaptive_model = OnlineLinear(
             feature_names=[
@@ -381,9 +382,37 @@ class TriggerBus:
         now = time.time()
         scored: List[ScoredTrigger] = []
         sampled_weights = self._ts_sampler.sample() if self._ts_sampler else None
+        session = get_current_session()
+        if session:
+            cooldown_cache: Dict[str, float] = session.get_cache(
+                "trigger_cooldown",
+                default_factory=dict,
+                ttl=2.0,
+                scope="trace",
+            )
+        else:
+            cooldown_cache = self.cooldown_cache
+
+        def _quiet_allows(trigger: Trigger) -> bool:
+            if session is None or not session.is_quiet():
+                return True
+            meta = trigger.meta or {}
+            source = str(meta.get("source", "")).lower()
+            if source == "user":
+                return True
+            if trigger.type in (TriggerType.THREAT, TriggerType.NEED):
+                return True
+            try:
+                immediacy = float(meta.get("immediacy", 0.0))
+            except (TypeError, ValueError):
+                immediacy = 0.0
+            return immediacy >= 0.75
+
         for fn in self.collectors:
             try:
                 for t in fn() or []:
+                    if not _quiet_allows(t):
+                        continue
                     t = self._normalize(t, valence=valence)
                     # hard overrides
                     if t.type is TriggerType.THREAT and t.meta.get("immediacy", 0.0) >= 0.8:
@@ -409,11 +438,21 @@ class TriggerBus:
                         if habit:
                             pr = 0.85 * pr + 0.15 * habit
                     key = self._key(t)
+                    if session and key:
+                        signature = f"{t.type.name}:{key}"
+                        if session.debounce(signature, window=0.4):
+                            continue
                     # cooldown 1.5s to avoid storms
                     if key is not None:
-                        if self.cooldown_cache.get(key, 0) + 1.5 > now:
+                        last_seen = cooldown_cache.get(key, 0)
+                        if last_seen + 0.4 > now:
                             continue
-                        self.cooldown_cache[key] = now
+                        cooldown_cache[key] = now
+                    if len(cooldown_cache) > 256:
+                        expire_before = now - 2.0
+                        for cache_key in list(cooldown_cache.keys()):
+                            if cooldown_cache[cache_key] < expire_before:
+                                cooldown_cache.pop(cache_key, None)
                     token = (
                         f"{key}:{int(now * 1000)}" if key is not None else f"anon:{id(t)}:{int(now * 1000)}"
                     )

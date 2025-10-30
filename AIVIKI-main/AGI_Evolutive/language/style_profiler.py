@@ -7,7 +7,7 @@ import os
 import json
 import re
 import unicodedata
-from datetime import datetime
+from datetime import UTC, datetime
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
@@ -534,7 +534,7 @@ class StyleProfiler:
                 profile.personal_names[name] = profile.personal_names.get(name, 0) + 1
         statements = self._extract_associative_statements(text)
         if statements:
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             existing = {
                 entry.get("text")
                 for entry in profile.associative_memory

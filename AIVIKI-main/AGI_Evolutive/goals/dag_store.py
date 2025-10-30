@@ -22,10 +22,15 @@ LOGGER = logging.getLogger(__name__)
 def _now() -> float:
     return time.time()
 
+def _strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
 
 def _normalize_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value or "")
-    return " ".join(normalized.strip().lower().split())
+    normalized = unicodedata.normalize("NFC", value or "")
+    folded = _strip_accents(normalized).casefold()
+    return " ".join(folded.strip().split())
 
 
 def normalize_goal_signature(
@@ -345,6 +350,8 @@ class DagStore:
         child = self.nodes.get(child_id)
         if not parent or not child:
             return
+        if self._creates_cycle(parent_id, child_id):
+            raise ValueError(f"Cycle detected when linking {parent_id}->{child_id}")
         if child_id not in parent.child_ids:
             parent.child_ids.append(child_id)
         if parent_id not in child.parent_ids:
@@ -352,6 +359,24 @@ class DagStore:
         parent.updated_at = _now()
         child.updated_at = _now()
         self._persist()
+
+    def _creates_cycle(self, parent_id: str, child_id: str) -> bool:
+        if parent_id == child_id:
+            return True
+        visited: Set[str] = set()
+        stack: List[str] = [parent_id]
+        while stack:
+            current = stack.pop()
+            if current == child_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            node = self.nodes.get(current)
+            if not node:
+                continue
+            stack.extend(node.parent_ids)
+        return False
 
     def update_goal(self, goal_id: str, updates: Dict[str, Any]) -> Optional[GoalNode]:
         node = self.nodes.get(goal_id)

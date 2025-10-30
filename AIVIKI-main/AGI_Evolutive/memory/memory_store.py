@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import re
+import tempfile
+import threading
 import time
 import uuid
 from collections import Counter
@@ -125,6 +127,7 @@ class MemoryStore:
         }
         self._dirty = 0
         self._hooks: Dict[str, Callable[[str, Dict[str, Any]], None]] = {}
+        self._lock = threading.RLock()
 
         if embed_fn is not None:
             self._embedder = embed_fn
@@ -151,8 +154,19 @@ class MemoryStore:
 
     def _save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fh:
-            json.dump(json_sanitize(self.state), fh, ensure_ascii=False, indent=2)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="memory_store", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(json_sanitize(self.state), fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self.path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         self._dirty = 0
         self.metrics["flushed"] = self.metrics.get("flushed", 0) + 1
         self.metrics["last_flush_ts"] = time.time()
@@ -165,13 +179,17 @@ class MemoryStore:
         name overwrites the previous callback.
         """
 
-        self._hooks[name] = callback
+        with self._lock:
+            self._hooks[name] = callback
 
     def unregister_hook(self, name: str) -> None:
-        self._hooks.pop(name, None)
+        with self._lock:
+            self._hooks.pop(name, None)
 
     def _emit_hooks(self, event: str, payload: Dict[str, Any]) -> None:
-        for name, hook in list(self._hooks.items()):
+        with self._lock:
+            hooks = list(self._hooks.items())
+        for name, hook in hooks:
             try:
                 hook(event, dict(payload))
             except Exception as exc:  # pragma: no cover - best-effort hooks
@@ -179,70 +197,73 @@ class MemoryStore:
 
     # ------------------------------------------------------------------
     def add_memory(self, entry: Dict[str, Any]) -> Dict[str, Any]:
-        data = dict(entry)
-        ts = data.get("ts", time.time())
-        data.setdefault("ts", ts)
-        data.setdefault("id", f"mem_{int(ts*1000)}_{uuid.uuid4().hex[:6]}")
-        data.setdefault("kind", data.get("kind", "generic"))
-        data.setdefault("score", _safe_float(data.get("score"), 0.0))
-        data.setdefault("uses", int(data.get("uses", 0)))
-        data.setdefault("tags", list(data.get("tags", [])))
-        data.setdefault("metadata", dict(data.get("metadata", {})))
-        llm_payload = {
-            "memory": {
-                "kind": data.get("kind"),
-                "text": data.get("text"),
-                "tags": list(data.get("tags", [])),
-                "salience": data.get("salience"),
-                "metadata": {k: v for k, v in data.get("metadata", {}).items() if isinstance(k, str)},
+        with self._lock:
+            data = dict(entry)
+            ts = data.get("ts", time.time())
+            data.setdefault("schema_version", 1)
+            data.setdefault("ts", ts)
+            data.setdefault("id", f"mem_{int(ts*1000)}_{uuid.uuid4().hex[:6]}")
+            data.setdefault("kind", data.get("kind", "generic"))
+            data.setdefault("score", _safe_float(data.get("score"), 0.0))
+            data.setdefault("uses", int(data.get("uses", 0)))
+            data.setdefault("tags", list(data.get("tags", [])))
+            data.setdefault("metadata", dict(data.get("metadata", {})))
+            llm_payload = {
+                "memory": {
+                    "kind": data.get("kind"),
+                    "text": data.get("text"),
+                    "tags": list(data.get("tags", [])),
+                    "salience": data.get("salience"),
+                    "metadata": {k: v for k, v in data.get("metadata", {}).items() if isinstance(k, str)},
+                }
             }
-        }
-        llm_response = try_call_llm_dict(
-            "memory_store_strategy",
-            input_payload=llm_payload,
-            logger=logger,
-        )
-        if llm_response:
-            normalized_kind = llm_response.get("normalized_kind")
-            if isinstance(normalized_kind, str) and normalized_kind.strip():
-                data["kind"] = normalized_kind.strip()
-            suggested_tags = llm_response.get("tags")
-            if isinstance(suggested_tags, list):
-                existing = list(data.get("tags", []))
-                for tag in suggested_tags:
-                    if isinstance(tag, str) and tag not in existing:
-                        existing.append(tag)
-                data["tags"] = existing
-            metadata_updates = llm_response.get("metadata_updates")
-            if isinstance(metadata_updates, Mapping):
-                data.setdefault("metadata", {}).update(metadata_updates)
-            retention = llm_response.get("retention_priority")
-            if isinstance(retention, str) and retention:
-                data.setdefault("metadata", {}).setdefault("retention_priority", retention)
-            notes = llm_response.get("notes")
-            if notes:
-                metadata = data.setdefault("metadata", {})
-                notes_list = metadata.setdefault("llm_notes", [])
-                if isinstance(notes_list, list):
-                    notes_list.append(notes)
-        self.state.setdefault("memories", []).append(data)
-        if len(self.state["memories"]) > self.max_items:
-            overflow = len(self.state["memories"]) - self.max_items
-            if overflow > 0:
-                evicted = self.state["memories"][:overflow]
-                for item in evicted:
-                    item_id = item.get("id")
-                    if item_id:
-                        self._index.remove(str(item_id))
-                self.state["memories"] = self.state["memories"][-self.max_items:]
-                self.metrics["evicted"] = self.metrics.get("evicted", 0) + len(evicted)
-        self._index.upsert(data)
-        self._dirty += 1
-        self.metrics["added"] = self.metrics.get("added", 0) + 1
-        self._emit_hooks("add", data)
-        if self._dirty >= self.flush_every:
-            self._save()
-        return data
+            llm_response = try_call_llm_dict(
+                "memory_store_strategy",
+                input_payload=llm_payload,
+                logger=logger,
+            )
+            if llm_response:
+                normalized_kind = llm_response.get("normalized_kind")
+                if isinstance(normalized_kind, str) and normalized_kind.strip():
+                    data["kind"] = normalized_kind.strip()
+                suggested_tags = llm_response.get("tags")
+                if isinstance(suggested_tags, list):
+                    existing = list(data.get("tags", []))
+                    for tag in suggested_tags:
+                        if isinstance(tag, str) and tag not in existing:
+                            existing.append(tag)
+                    data["tags"] = existing
+                metadata_updates = llm_response.get("metadata_updates")
+                if isinstance(metadata_updates, Mapping):
+                    data.setdefault("metadata", {}).update(metadata_updates)
+                retention = llm_response.get("retention_priority")
+                if isinstance(retention, str) and retention:
+                    data.setdefault("metadata", {}).setdefault("retention_priority", retention)
+                notes = llm_response.get("notes")
+                if notes:
+                    metadata = data.setdefault("metadata", {})
+                    notes_list = metadata.setdefault("llm_notes", [])
+                    if isinstance(notes_list, list):
+                        notes_list.append(notes)
+
+            self.state.setdefault("memories", []).append(data)
+            if len(self.state["memories"]) > self.max_items:
+                overflow = len(self.state["memories"]) - self.max_items
+                if overflow > 0:
+                    evicted = self.state["memories"][:overflow]
+                    for item in evicted:
+                        item_id = item.get("id")
+                        if item_id:
+                            self._index.remove(str(item_id))
+                    self.state["memories"] = self.state["memories"][-self.max_items:]
+                    self.metrics["evicted"] = self.metrics.get("evicted", 0) + len(evicted)
+            self._index.upsert(data)
+            self._dirty += 1
+            self.metrics["added"] = self.metrics.get("added", 0) + 1
+            self._emit_hooks("add", data)
+            if self._dirty >= self.flush_every:
+                self._save()
+            return data
 
     def get_recent_memories(self, n: int = 50) -> List[Dict[str, Any]]:
         if n <= 0:
