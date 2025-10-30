@@ -26,14 +26,19 @@ import random
 import threading
 import time
 import traceback
-from collections import deque
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
 from AGI_Evolutive.knowledge.mechanism_store import MechanismStore
 from AGI_Evolutive.cognition.principle_inducer import PrincipleInducer
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    should_defer_background_llm,
+    try_call_llm_dict,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+    from AGI_Evolutive.runtime.job_manager import JobManager
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
     from AGI_Evolutive.runtime.job_manager import JobManager
@@ -309,7 +314,6 @@ class Scheduler:
 
         self.workspace = getattr(self.arch, "global_workspace", None)
         self._urgent_pause_logged = False
-        self._job_manager_warning_emitted = False
 
         policy = getattr(self.arch, "policy", None)
         mechanism_store = None
@@ -691,6 +695,10 @@ class Scheduler:
             "duration": duration,
             "success": success,
         }
+        if should_defer_background_llm():
+            logger.debug("Skip LLM spec 'scheduler' (urgent chain active)")
+            return
+
         response = try_call_llm_dict(
             "scheduler",
             input_payload=payload,
@@ -925,63 +933,46 @@ class Scheduler:
 
     def _loop(self):
         while self.running and self.state.get("enabled", True):
-            event_payload = self._wait_for_event()
-            if event_payload is None:
-                break
-            event, payload = event_payload
             if self._should_pause_for_urgent_chain():
-                self._schedule_delayed_event(event, payload, 0.3)
                 continue
-            self._process_event(event, payload)
+            now = _now()
+            for name, cfg in self.tasks.items():
+                last = float(self.state["last_runs"].get(name, 0.0))
+                policy = cfg.get("policy")
+                interval = cfg.get("interval", 0.0)
+                if policy is not None:
+                    interval = policy.current_interval
+                due = last + interval
+                if now >= due:
+                    # jitter léger
+                    j = cfg["jitter"]
+                    if j > 0:
+                        time.sleep(min(j, 0.25))  # lissé
 
-    def _resolve_job_manager(self) -> Optional["JobManager"]:
-        jm = getattr(self.arch, "job_manager", None)
-        if jm is None:
-            if not self._job_manager_warning_emitted:
-                logger.warning("Scheduler running without job_manager interface")
-                self._job_manager_warning_emitted = True
-            return None
+                    t0 = _now()
+                    ok = True
+                    err = None
+                    try:
+                        cfg["fn"]()
+                    except Exception as e:
+                        ok = False
+                        err = f"{e}\n{traceback.format_exc()}"
+                    t1 = _now()
 
-        missing = [name for name in ("is_urgent_active", "wait_until_cleared") if not callable(getattr(jm, name, None))]
-        if missing:
-            if not self._job_manager_warning_emitted:
-                logger.error(
-                    "JobManager missing required methods: %s", ", ".join(missing)
-                )
-                self._job_manager_warning_emitted = True
-            return None
-
-        self._job_manager_warning_emitted = False
-        return jm
-
-    def _should_pause_for_urgent_chain(self) -> bool:
-        jm = self._resolve_job_manager()
-        if not jm:
-            if self._urgent_pause_logged:
-                logger.info("Scheduler resume: urgent chain cleared")
-                self._urgent_pause_logged = False
-            return False
-
-        try:
-            active = bool(jm.is_urgent_active())
-        except Exception:
-            logger.exception("JobManager.is_urgent_active failed")
-            active = False
-
-        if active:
-            if not self._urgent_pause_logged:
-                logger.info("Scheduler pause: urgent job chain active")
-                self._urgent_pause_logged = True
-            try:
-                jm.wait_until_cleared(timeout=0.5)
-            except Exception:
-                logger.exception("JobManager.wait_until_cleared failed")
-            return True
-
-        if self._urgent_pause_logged:
-            logger.info("Scheduler resume: urgent chain cleared")
-            self._urgent_pause_logged = False
-        return False
+                    self.state["last_runs"][name] = t1
+                    duration = t1 - t0
+                    if policy is not None:
+                        self._update_task_policy(name, policy, ok, duration)
+                        cfg["interval"] = policy.current_interval
+                    if policy is not None:
+                        self.state["policies"][name] = policy.to_state()
+                    _write_json(self.paths["state"], self.state)
+                    _append_jsonl(self.paths["log"], {
+                        "t0": t0, "t1": t1, "dt": duration, "task": name, "ok": ok, "err": err,
+                        "interval": interval,
+                        "next_interval": cfg.get("interval"),
+                    })
+            time.sleep(0.5)
 
     # ---------- coordination with job manager ----------
     def _resolve_job_manager(self) -> Optional["JobManager"]:

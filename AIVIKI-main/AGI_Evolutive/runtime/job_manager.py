@@ -769,11 +769,6 @@ class JobManager:
             self._set_urgent_state_locked(active)
             return active
 
-    def is_urgent_active(self) -> bool:
-        """Public API used by the scheduler to query urgent chains."""
-
-        return self.has_active_urgent_chain()
-
     def pause_if_urgent_active(self, timeout: float = 0.2) -> bool:
         """Bloque brièvement l'appelant si une chaîne urgente est active."""
 
@@ -782,14 +777,6 @@ class JobManager:
                 return False
             self._urgent_condition.wait(timeout)
             return True
-
-    def wait_until_cleared(self, timeout: float = 0.5) -> None:
-        """Bloque jusqu'à dissipation de la fenêtre urgente ou timeout."""
-
-        with self._urgent_condition:
-            if not self._urgent_state:
-                return
-            self._urgent_condition.wait(timeout)
 
     def _compute_urgent_state_locked(self) -> bool:
         urgent_types = {"SIGNAL", "THREAT", "NEED"}

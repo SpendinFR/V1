@@ -189,9 +189,13 @@ def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
                         thread_label,
                     )
                 _CALL_CONDITION.wait(timeout=0.2)
+            acquired = True
         finally:
-            if is_urgent:
+            if is_urgent and not acquired:
                 _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
+
+        if is_urgent:
+            _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
 
         if wait_started is not None:
             LOGGER.info(
@@ -252,6 +256,8 @@ def _await_urgent_clearance(
     wait_started: Optional[float] = None
 
     while True:
+        if _current_thread_is_urgent():
+            break
         active = _is_global_urgent_active()
         if not active and _URGENT_ACTIVE_CHECK is not None:
             try:
@@ -386,6 +392,24 @@ def manual_urgent_exit() -> None:
 def _is_global_urgent_active() -> bool:
     with _URGENT_STATE_LOCK:
         return _GLOBAL_URGENT_STATE
+
+
+def is_urgent_mode_active() -> bool:
+    """Expose whether an urgent chain is currently active anywhere in the system."""
+
+    return _is_global_urgent_active()
+
+
+def current_thread_is_urgent() -> bool:
+    """Return ``True`` if the caller belongs to an urgent execution context."""
+
+    return _current_thread_is_urgent()
+
+
+def should_defer_background_llm() -> bool:
+    """Indicate whether background LLM calls should defer due to urgent work."""
+
+    return _is_global_urgent_active() and not _current_thread_is_urgent()
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -628,10 +652,13 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "current_thread_is_urgent",
+    "is_urgent_mode_active",
     "manual_urgent_enter",
     "manual_urgent_exit",
     "get_llm_manager",
     "get_recent_llm_activity",
+    "should_defer_background_llm",
     "is_llm_enabled",
     "register_urgent_gate",
     "set_llm_manager",
