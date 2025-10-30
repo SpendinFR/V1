@@ -265,6 +265,28 @@ class ActionInterface:
         self.auto_signal_registry: Optional[AutoSignalRegistry] = None
         self._last_action_scores: Dict[str, Any] = {}
 
+    def _notify_scheduler(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        arch = self.bound.get("arch")
+        scheduler = getattr(arch, "scheduler", None) if arch is not None else None
+        if not scheduler or not hasattr(scheduler, "notify"):
+            return
+        try:
+            scheduler.notify(event, payload=payload)
+        except Exception:
+            pass
+
+    def _notify_action_event(self, action: Action) -> None:
+        payload: Dict[str, Any] = {
+            "action_id": action.id,
+            "action_type": action.type,
+            "status": action.status,
+        }
+        if isinstance(action.result, dict) and "ok" in action.result:
+            try:
+                payload["ok"] = bool(action.result.get("ok"))
+            except Exception:
+                payload["ok"] = action.result.get("ok")
+        self._notify_scheduler("action_completed", payload)
     def _resolve_auto_signal_cache(self) -> Dict[str, Dict[str, float]]:
         session = get_current_session()
         if session is not None:
