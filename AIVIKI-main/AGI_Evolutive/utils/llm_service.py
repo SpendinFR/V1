@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from itertools import islice
 
@@ -89,8 +89,6 @@ _CALL_CONDITION = threading.Condition()
 _CALL_OWNER: Optional[int] = None
 _CALL_DEPTH = 0
 _WAITING_URGENT = 0
-_RETRY_REGISTRY: Dict[str, float] = {}
-_RETRY_LOCK = threading.Lock()
 
 
 class _RecentDuplicateFilter(logging.Filter):
@@ -459,7 +457,6 @@ class LLMIntegrationManager:
         extra_instructions: Optional[Sequence[str]] = None,
         max_retries: int = 1,
         skip_urgent_gate: bool = False,
-        session: Optional["SessionContext"] = None,
         logger: Optional[Any] = None,
     ) -> LLMInvocation:
         if not self._enabled:
@@ -484,21 +481,6 @@ class LLMIntegrationManager:
                 )
             instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
 
-            chosen_model = spec.preferred_model
-            if session is not None and not session.allow_model(chosen_model):
-                locked = getattr(session, "locked_model", None)
-                if locked:
-                    LOGGER.debug(
-                        "Session %s/%s force model '%s' instead of spec '%s'",
-                        getattr(session, "user_id", "?"),
-                        getattr(session, "session_id", "?"),
-                        locked,
-                        chosen_model,
-                    )
-                    chosen_model = locked
-
-            model_config = self._resolve_model(chosen_model)
-
             result = self._client.generate_json(
                 model_config,
                 spec.prompt_goal,
@@ -512,9 +494,6 @@ class LLMIntegrationManager:
         finally:
             _release_call_slot()
 
-        with self._lock:
-            self._last_model_used = model_config.name
-
         return LLMInvocation(spec=spec, result=result, model_used=model_config.name)
 
     def call_dict(
@@ -525,7 +504,6 @@ class LLMIntegrationManager:
         extra_instructions: Optional[Sequence[str]] = None,
         max_retries: int = 1,
         skip_urgent_gate: bool = False,
-        session: Optional["SessionContext"] = None,
         logger: Optional[Any] = None,
     ) -> Mapping[str, Any]:
         invocation = self.call_json(
@@ -534,7 +512,6 @@ class LLMIntegrationManager:
             extra_instructions=extra_instructions,
             max_retries=max_retries,
             skip_urgent_gate=skip_urgent_gate,
-            session=session,
             logger=logger,
         )
         parsed = invocation.result.parsed
@@ -619,17 +596,65 @@ def try_call_llm_dict(
         thread_label=thread_label,
     )
 
-    if session is None:
-        from AGI_Evolutive.core.session_context import get_current_session
-
-        session = get_current_session()
-
-    if dedupe_key:
-        with _RETRY_LOCK:
-            last = _RETRY_REGISTRY.get(dedupe_key)
-            if last and (time.time() - last) < 60.0:
-                LOGGER.info(
-                    "LLM spec '%s' ignorée (dedupe window active) – thread %s", spec_key, thread_label
+    call_started_at = time.time()
+    try:
+        manager = get_llm_manager()
+        payload = manager.call_dict(
+            spec_key,
+            input_payload=input_payload,
+            extra_instructions=extra_instructions,
+            max_retries=max_retries,
+            skip_urgent_gate=False,
+            logger=logger,
+        )
+        now = time.time()
+        total_duration = now - request_ts
+        call_duration = now - call_started_at
+        LOGGER.info(
+            "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+            spec_key,
+            total_duration,
+            call_duration,
+            thread_label,
+        )
+        _record_activity(spec_key, "success", None)
+        return payload
+    except (LLMUnavailableError, LLMIntegrationError) as exc:
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.warning(
+            "LLM spec '%s' indisponible après %.2fs – thread %s : %s",
+            spec_key,
+            total_duration,
+            thread_label,
+            exc,
+        )
+        _record_activity(spec_key, "error", str(exc))
+        if logger is not None:
+            try:
+                logger.debug(
+                    "LLM integration '%s' unavailable: %s", spec_key, exc, exc_info=True
+                )
+            except Exception:  # pragma: no cover - defensive logging guard
+                pass
+        return None
+    except Exception as exc:  # pragma: no cover - unexpected failure safety net
+        now = time.time()
+        total_duration = now - request_ts
+        LOGGER.exception(
+            "Erreur inattendue pour la spec LLM '%s' après %.2fs – thread %s",
+            spec_key,
+            total_duration,
+            thread_label,
+        )
+        _record_activity(spec_key, "error", str(exc))
+        if logger is not None:
+            try:
+                logger.warning(
+                    "Unexpected error while calling LLM integration '%s': %s",
+                    spec_key,
+                    exc,
+                    exc_info=True,
                 )
                 return None
             _RETRY_REGISTRY[dedupe_key] = request_ts

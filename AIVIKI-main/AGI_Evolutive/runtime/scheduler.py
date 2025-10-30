@@ -26,18 +26,7 @@ import random
 import threading
 import time
 import traceback
-from collections import deque
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Deque,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
@@ -47,9 +36,6 @@ from AGI_Evolutive.utils.llm_service import (
     should_defer_background_llm,
     try_call_llm_dict,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
-    from AGI_Evolutive.runtime.job_manager import JobManager
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
     from AGI_Evolutive.runtime.job_manager import JobManager
