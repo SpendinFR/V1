@@ -90,6 +90,11 @@ _CALL_OWNER: Optional[int] = None
 _CALL_DEPTH = 0
 _WAITING_URGENT = 0
 
+# Track retry attempts for unexpected errors.  Guarded by a global lock so that
+# concurrent threads updating the registry do not race with each other.
+_RETRY_LOCK = threading.Lock()
+_RETRY_REGISTRY: MutableMapping[str, float] = {}
+
 
 class _RecentDuplicateFilter(logging.Filter):
     """Filter to drop immediate duplicate log records for readability."""
