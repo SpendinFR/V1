@@ -17,6 +17,7 @@ though the file passed static syntax checks.  Restoring the missing imports
 and using the fully qualified package path fixes the scheduler logic.
 """
 
+import heapq
 import json
 import logging
 import math
@@ -35,6 +36,9 @@ from AGI_Evolutive.utils.llm_service import (
     should_defer_background_llm,
     try_call_llm_dict,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+    from AGI_Evolutive.runtime.job_manager import JobManager
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
     from AGI_Evolutive.runtime.job_manager import JobManager
@@ -275,6 +279,7 @@ class Scheduler:
         self.state.setdefault("policies", {})
         self.state.setdefault("models", {})
         self.state["models"].setdefault("reflection", {})
+        self.state.setdefault("last_events", {})
         self.running = False
         self.thread = None
 
@@ -282,6 +287,12 @@ class Scheduler:
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self._policies: Dict[str, AdaptiveTaskPolicy] = {}
         self._pending_reflection_update: Optional[Dict[str, Any]] = None
+        self._event_queue: Deque[Tuple[str, Dict[str, Any]]] = deque()
+        self._condition = threading.Condition()
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._schedule: List[Tuple[float, str]] = []
+        self._delayed_timers: Dict[str, Dict[str, Any]] = {}
 
         reflection_state = self.state["models"].get("reflection", {})
         self._reflection_model = OnlineLogistic(
@@ -316,7 +327,7 @@ class Scheduler:
                 try:
                     policy._mechanisms = mechanism_store
                 except Exception:
-                    pass
+                    self._log_exception("policy._mechanisms attachment")
         setattr(self.arch, "mechanism_store", mechanism_store)
         self.mechanism_store = mechanism_store
 
@@ -348,6 +359,17 @@ class Scheduler:
         except Exception:
             self._tick_counter = self._tick
 
+        # Émet un premier événement pour exécuter les tâches critiques au démarrage
+        try:
+            self.notify("boot", {"reason": "startup"})
+        except Exception:
+            pass
+
+        # ---------- helpers ----------
+    def _log_exception(self, context: str) -> None:
+        """Centralized logging for unexpected scheduler errors."""
+        logger.exception("Scheduler error during %s", context)
+
     # ---------- helpers ----------
     def _build_state_snapshot(self) -> Dict[str, Any]:
         arch = self.arch
@@ -373,7 +395,7 @@ class Scheduler:
                 if isinstance(registry, dict):
                     return registry
             except Exception:
-                pass
+                self._log_exception("policy.build_predicate_registry")
 
         dialogue = state.get("dialogue")
         world = state.get("world")
@@ -390,6 +412,7 @@ class Scheduler:
                         if fn(topic):
                             return True
                     except Exception:
+                        self._log_exception(f"belief accessor {accessor}")
                         continue
             return False
 
@@ -402,6 +425,7 @@ class Scheduler:
             try:
                 return float(confidence_for(topic)) >= float(threshold)
             except Exception:
+                self._log_exception("belief confidence lookup")
                 return False
 
         registry: Dict[str, Callable[..., bool]] = {
@@ -452,6 +476,7 @@ class Scheduler:
                     }
                     text = renderer.render_reply(semantics, ctx)
                 except Exception:
+                    self._log_exception("language.renderer.render_reply")
                     text = decision.get("decision_text") or text
         arch.last_output_text = text
         logger = getattr(arch, "logger", None)
@@ -459,7 +484,7 @@ class Scheduler:
             try:
                 logger.write("gw.decision", decision=decision, rendered=text)
             except Exception:
-                pass
+                self._log_exception("arch.logger.write gw.decision")
 
     # ---------- registration ----------
     def _init_policy(self, name: str, interval_s: float) -> AdaptiveTaskPolicy:
@@ -473,26 +498,93 @@ class Scheduler:
         self._policies[name] = policy
         return policy
 
-    def register(self, name: str, fn: Callable[[], None], interval_s: float, jitter_s: float = 0.0):
+    def register(
+        self,
+        name: str,
+        fn: Callable[[], None],
+        interval_s: float,
+        jitter_s: float = 0.0,
+        *,
+        triggers: Optional[Sequence[str]] = None,
+        predicate: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+    ):
         policy = self._init_policy(name, float(interval_s))
+        trigger_set = None
+        if triggers:
+            trigger_set = {str(event).strip() for event in triggers if str(event).strip()}
         self.tasks[name] = {
             "fn": fn,
             "interval": policy.current_interval,
             "jitter": float(jitter_s),
             "policy": policy,
             "base_interval": float(interval_s),
+            "triggers": trigger_set,
+            "predicate": predicate,
         }
         self.state["policies"][name] = policy.to_state()
+        last_run = float(self.state["last_runs"].get(name, 0.0))
+        now = _now()
+        interval = policy.current_interval or float(interval_s)
+        due = max(now, last_run + interval)
+        jitter = float(jitter_s)
+        if jitter > 0.0:
+            due += random.uniform(0.0, jitter)
+        with self._cond:
+            heapq.heappush(self._schedule, (due, name))
+            self._cond.notify_all()
 
     def _register_default_tasks(self):
         # Les fonctions sont toutes robustifiées (attr checks)
-        self.register("homeostasis", self._task_homeostasis, interval_s=60.0, jitter_s=5.0)
-        self.register("consolidation", self._task_consolidation, interval_s=180.0, jitter_s=10.0)
-        self.register("concepts", self._task_concepts, interval_s=45.0, jitter_s=5.0)
-        self.register("episodes", self._task_episodes, interval_s=60.0, jitter_s=5.0)
-        self.register("planning", self._task_planning, interval_s=90.0, jitter_s=8.0)
-        self.register("reflection", self._task_reflection, interval_s=120.0, jitter_s=10.0)
-        self.register("evolution", self._task_evolution, interval_s=120.0, jitter_s=10.0)
+        common_boot = ("boot",)
+        self.register(
+            "homeostasis",
+            self._task_homeostasis,
+            interval_s=60.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("user_cycle", "inbox_update", "action_completed", "job_event"),
+        )
+        self.register(
+            "consolidation",
+            self._task_consolidation,
+            interval_s=180.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("inbox_update", "action_completed", "job_event"),
+        )
+        self.register(
+            "concepts",
+            self._task_concepts,
+            interval_s=45.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("inbox_update", "user_cycle"),
+        )
+        self.register(
+            "episodes",
+            self._task_episodes,
+            interval_s=60.0,
+            jitter_s=5.0,
+            triggers=common_boot + ("user_cycle", "action_completed"),
+        )
+        self.register(
+            "planning",
+            self._task_planning,
+            interval_s=90.0,
+            jitter_s=8.0,
+            triggers=common_boot + ("user_cycle", "action_completed"),
+        )
+        self.register(
+            "reflection",
+            self._task_reflection,
+            interval_s=120.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("action_completed", "job_event"),
+        )
+        self.register(
+            "evolution",
+            self._task_evolution,
+            interval_s=120.0,
+            jitter_s=10.0,
+            triggers=common_boot + ("user_cycle", "job_event"),
+        )
 
     # ---------- adaptation helpers ----------
     def _scalarize_metrics(self, metrics: Dict[str, Any]) -> float:
@@ -580,7 +672,7 @@ class Scheduler:
             self._reflection_model.update(features, label)
             self._reflection_calibrator.update(raw_prob, label)
         except Exception:
-            pass
+            self._log_exception("reflection model update")
         self.state["models"]["reflection"] = {
             "logistic": self._reflection_model.to_state(),
             "calibrator": self._reflection_calibrator.to_state(),
@@ -623,16 +715,219 @@ class Scheduler:
             policy.current_interval = min(policy.base_interval * 3.0, policy.current_interval * 1.2)
         policy.llm_last = dict(response)  # type: ignore[attr-defined]
 
+    def notify(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        event_name = str(event).strip()
+        if not event_name:
+            return
+        event_payload = dict(payload or {})
+        with self._condition:
+            self._event_queue.append((event_name, event_payload))
+            self._condition.notify_all()
+
+    def _wait_for_event(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        with self._condition:
+            while (
+                self.running
+                and self.state.get("enabled", True)
+                and not self._event_queue
+            ):
+                self._condition.wait(timeout=1.0)
+            if not self.running or not self.state.get("enabled", True):
+                return None
+            return self._event_queue.popleft()
+
+    def _should_run_for_event(self, cfg: Dict[str, Any], event: str, payload: Dict[str, Any]) -> bool:
+        predicate = cfg.get("predicate")
+        if callable(predicate):
+            try:
+                return bool(predicate(event, payload))
+            except Exception:
+                return False
+        triggers: Optional[Set[str]] = cfg.get("triggers")
+        if triggers:
+            return event in triggers
+        return True
+
+    def _schedule_delayed_event(self, event: str, payload: Dict[str, Any], delay: float) -> None:
+        try:
+            delay_val = max(0.05, float(delay))
+        except Exception:
+            delay_val = 0.1
+
+        payload_copy = dict(payload)
+        run_at = _now() + delay_val
+
+        def _emit_later() -> None:
+            with self._condition:
+                entry = self._delayed_timers.get(event)
+                if entry and entry.get("timer") is timer:
+                    payload_to_emit = dict(entry.get("payload") or payload_copy)
+                    self._delayed_timers.pop(event, None)
+                    self._event_queue.append((event, payload_to_emit))
+                    self._condition.notify_all()
+
+        timer = threading.Timer(delay_val, _emit_later)
+        timer.daemon = True
+        with self._condition:
+            entry = self._delayed_timers.get(event)
+            if entry is not None:
+                existing_timer = entry.get("timer") if isinstance(entry, dict) else None
+                scheduled_for = float(entry.get("run_at", 0.0)) if isinstance(entry, dict) else 0.0
+                if scheduled_for <= run_at:
+                    if isinstance(entry, dict):
+                        entry["payload"] = payload_copy
+                    return
+                if isinstance(existing_timer, threading.Timer):
+                    try:
+                        existing_timer.cancel()
+                    except Exception:
+                        pass
+            self._delayed_timers[event] = {
+                "timer": timer,
+                "run_at": run_at,
+                "payload": payload_copy,
+            }
+
+        timer.start()
+
+    def _run_task(
+        self,
+        name: str,
+        cfg: Dict[str, Any],
+        *,
+        event: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        policy = cfg.get("policy")
+        interval = cfg.get("interval", 0.0)
+        if policy is not None:
+            interval = policy.current_interval
+
+        jitter = float(cfg.get("jitter", 0.0))
+        if jitter > 0:
+            time.sleep(min(jitter, 0.25))
+
+        t0 = _now()
+        ok = True
+        err = None
+        try:
+            cfg["fn"]()
+        except Exception as e:
+            ok = False
+            err = f"{e}\n{traceback.format_exc()}"
+        t1 = _now()
+
+        self.state["last_runs"][name] = t1
+        duration = t1 - t0
+        if policy is not None:
+            self._update_task_policy(name, policy, ok, duration)
+            cfg["interval"] = policy.current_interval
+            self.state["policies"][name] = policy.to_state()
+        sanitized_payload = json_sanitize(payload)
+        self.state.setdefault("last_events", {})[name] = {
+            "event": event,
+            "payload": sanitized_payload,
+            "ts": t1,
+        }
+        _write_json(self.paths["state"], self.state)
+        _append_jsonl(
+            self.paths["log"],
+            {
+                "t0": t0,
+                "t1": t1,
+                "dt": duration,
+                "task": name,
+                "ok": ok,
+                "err": err,
+                "interval": interval,
+                "next_interval": cfg.get("interval"),
+                "event": event,
+                "event_payload": sanitized_payload,
+            },
+        )
+
+    def _process_event(self, event: str, payload: Dict[str, Any]) -> None:
+        now = _now()
+        rerun_after: Optional[float] = None
+        for name, cfg in self.tasks.items():
+            if not self._should_run_for_event(cfg, event, payload):
+                continue
+            last = float(self.state["last_runs"].get(name, 0.0))
+            policy = cfg.get("policy")
+            interval = cfg.get("interval", 0.0)
+            if policy is not None:
+                interval = policy.current_interval
+            elapsed = now - last
+            if interval > 0.0 and elapsed < interval:
+                remaining = interval - elapsed
+                if rerun_after is None or remaining < rerun_after:
+                    rerun_after = remaining
+                continue
+            self._run_task(name, cfg, event=event, payload=payload)
+
+        if rerun_after is not None:
+            self._schedule_delayed_event(event, payload, rerun_after)
+
     # ---------- run loop ----------
     def start(self):
         if self.running:
             return
+        self._rebuild_schedule()
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
+    def _rebuild_schedule(self) -> None:
+        """Rebuild the internal priority queue of periodic tasks.
+
+        Earlier versions of the scheduler dynamically populated
+        ``self._schedule`` when tasks were registered, but they never
+        re-synchronised it with the persisted state on start-up.  The
+        ``start`` method still calls :meth:`_rebuild_schedule`, yet the
+        helper was accidentally dropped during a refactor which left the
+        attribute access dangling.  Re-introducing the method keeps the
+        behaviour consistent with the previous implementation and avoids an
+        ``AttributeError`` during initialisation.
+        """
+
+        now = _now()
+        with self._cond:
+            self._schedule.clear()
+            for name, cfg in self.tasks.items():
+                policy: Optional[AdaptiveTaskPolicy] = cfg.get("policy")
+                interval = 0.0
+                if policy is not None:
+                    interval = float(max(0.0, policy.current_interval))
+                else:
+                    interval = float(max(0.0, cfg.get("interval", 0.0)))
+                base_interval = float(max(interval, cfg.get("base_interval", interval)))
+                if interval <= 0.0:
+                    interval = base_interval
+
+                last_run = float(self.state["last_runs"].get(name, 0.0))
+                due = last_run + interval if last_run > 0.0 else now
+                if due < now:
+                    due = now
+
+                jitter = float(cfg.get("jitter", 0.0))
+                if jitter > 0.0:
+                    due += random.uniform(0.0, jitter)
+
+                heapq.heappush(self._schedule, (due, name))
+            self._cond.notify_all()
+
     def stop(self):
         self.running = False
+        with self._condition:
+            self._condition.notify_all()
+            for entry in list(self._delayed_timers.values()):
+                timer = entry.get("timer") if isinstance(entry, dict) else None
+                if isinstance(timer, threading.Timer):
+                    try:
+                        timer.cancel()
+                    except Exception:
+                        pass
+            self._delayed_timers.clear()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
@@ -743,7 +1038,7 @@ class Scheduler:
             try:
                 emo.adjust_if_needed()
             except Exception:
-                pass
+                self._log_exception("emotions.adjust_if_needed")
 
     def _task_consolidation(self):
         # mémoire/learning : consolidation (si dispo)
@@ -756,21 +1051,21 @@ class Scheduler:
                 learn.consolidate()
                 return
             except Exception:
-                pass
+                self._log_exception("learning.consolidate")
         # memory
         if mem and hasattr(mem, "consolidate"):
             try:
                 mem.consolidate()
                 return
             except Exception:
-                pass
+                self._log_exception("memory.consolidate")
         # consolidator (style VIKI+)
         cons = getattr(self.arch, "consolidator", None)
         if cons and hasattr(cons, "run_once_now"):
             try:
                 cons.run_once_now(scope="auto")
             except Exception:
-                pass
+                self._log_exception("consolidator.run_once_now")
 
     def _task_concepts(self):
         ce = getattr(self.arch, "concept_extractor", None)
@@ -789,6 +1084,7 @@ class Scheduler:
         try:
             applicable = list(self.mechanism_store.scan_applicable(state, predicate_registry))
         except Exception:
+            self._log_exception("mechanism_store.scan_applicable")
             applicable = []
         self._last_applicable_mais = applicable
 
@@ -799,6 +1095,7 @@ class Scheduler:
             try:
                 bids = list(mechanism.propose(state))
             except Exception:
+                self._log_exception(f"mechanism.propose {getattr(mechanism, 'id', 'unknown')}")
                 continue
             for bid in bids:
                 try:
@@ -820,12 +1117,12 @@ class Scheduler:
                 goals.step()
                 return
             except Exception:
-                pass
+                self._log_exception("goals.step")
         if goals and hasattr(goals, "refresh_plans"):
             try:
                 goals.refresh_plans()
             except Exception:
-                pass
+                self._log_exception("goals.refresh_plans")
         workspace = self._get_workspace()
         policy = getattr(self.arch, "policy", None)
         if workspace and policy and hasattr(workspace, "step") and hasattr(policy, "decide_with_bids"):
@@ -834,11 +1131,13 @@ class Scheduler:
                 workspace.step(state, timebox_iters=2)
                 winners = list(workspace.winners())
             except Exception:
+                self._log_exception("workspace.step")
                 winners = []
             if not winners:
                 try:
                     winners = list(workspace.last_trace())
                 except Exception:
+                    self._log_exception("workspace.last_trace")
                     winners = []
             try:
                 decision = policy.decide_with_bids(
@@ -851,6 +1150,7 @@ class Scheduler:
                     ctx={"scheduler": True, "workspace_trace": [bid.origin_tag() for bid in winners]},
                 )
             except Exception:
+                self._log_exception("policy.decide_with_bids")
                 decision = None
 
             if decision:
@@ -868,6 +1168,7 @@ class Scheduler:
                         runtime.emit(utterance)
                         emitted = True
                     except Exception:
+                        self._log_exception("response_api.format_agent_reply/runtime.emit")
                         emitted = False
                 if not emitted:
                     self._render_and_emit(decision, state)
@@ -884,6 +1185,7 @@ class Scheduler:
                             try:
                                 outcome = critic.last_outcome() or {}
                             except Exception:
+                                self._log_exception("SocialCritic.last_outcome")
                                 outcome = {}
                         if outcome:
                             self._last_planning_outcome = outcome
@@ -903,11 +1205,12 @@ class Scheduler:
                                 try:
                                     self.mechanism_store.update(mechanism)
                                 except Exception:
-                                    pass
+                                    self._log_exception("mechanism_store.update")
                             except Exception:
+                                self._log_exception(f"mechanism feedback update {getattr(mechanism, 'id', 'unknown')}")
                                 continue
                     except Exception:
-                        pass
+                        self._log_exception("SocialCritic evaluation")
                 # If no social evaluation is available we keep the pending
                 # reflection update until feedback arrives, avoiding neutral
                 # training data that would collapse the model.
@@ -933,8 +1236,8 @@ class Scheduler:
                 depth=depth
             )
         except Exception:
+            self._log_exception("metacognition.trigger_reflection")
             self._pending_reflection_update = None
-            pass
 
     def _task_evolution(self):
         evo = getattr(self.arch, "evolution", None)
@@ -945,7 +1248,7 @@ class Scheduler:
                 # potentiellement proposer des évolutions (non destructif)
                 evo.propose_evolution()
             except Exception:
-                pass
+                self._log_exception("evolution.record_cycle/propose_evolution")
         self._tick = getattr(self, "_tick", 0) + 1
         self._tick_counter = self._tick
         if self._tick % self._evolution_period == 0:
@@ -962,6 +1265,7 @@ class Scheduler:
                     try:
                         recent_docs = memory.get_recent_memories(n=200)
                     except Exception:
+                        self._log_exception("memory.get_recent_memories")
                         recent_docs = []
 
             if hasattr(arch, "recent_dialogues"):
@@ -974,6 +1278,7 @@ class Scheduler:
                     try:
                         recent_dialogues = dialogue_log.get_recent(100)
                     except Exception:
+                        self._log_exception("dialogue_log.get_recent")
                         recent_dialogues = []
 
             metrics_snapshot: Dict[str, Any] = {}
@@ -982,6 +1287,7 @@ class Scheduler:
                 try:
                     metrics_snapshot = metrics.snapshot() or {}
                 except Exception:
+                    self._log_exception("metrics.snapshot")
                     metrics_snapshot = {}
             self._last_metrics_snapshot = metrics_snapshot or {}
             new_value = self._scalarize_metrics(self._last_metrics_snapshot)
@@ -996,4 +1302,4 @@ class Scheduler:
             try:
                 self.principle_inducer.run(recent_docs, recent_dialogues, metrics_snapshot)
             except Exception:
-                pass
+                self._log_exception("principle_inducer.run")
