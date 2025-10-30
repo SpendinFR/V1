@@ -3,16 +3,30 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from itertools import islice
 
 from .llm_client import LLMCallError, LLMResult, OllamaLLMClient, OllamaModelConfig
 from .llm_specs import LLMIntegrationSpec, get_spec
+
+
+if TYPE_CHECKING:  # pragma: no cover - import for typing only
+    from AGI_Evolutive.core.session_context import SessionContext
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -52,6 +66,7 @@ class LLMInvocation:
 
     spec: LLMIntegrationSpec
     result: LLMResult
+    model_used: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +89,20 @@ _GLOBAL_URGENT_STATE = False
 _URGENT_STATE_LOCK = threading.Lock()
 _URGENT_CLEAR_EVENT = threading.Event()
 _URGENT_CLEAR_EVENT.set()
+_THREAD_LOCAL = threading.local()
+
+# Gate used to serialize LLM calls and to make urgent callers pre-empt background
+# integrations.  The condition protects the ownership bookkeeping so that urgent
+# chains can reserve the slot for their entire duration while other threads wait.
+_CALL_CONDITION = threading.Condition()
+_CALL_OWNER: Optional[int] = None
+_CALL_DEPTH = 0
+_WAITING_URGENT = 0
+
+# Track retry attempts for unexpected errors.  Guarded by a global lock so that
+# concurrent threads updating the registry do not race with each other.
+_RETRY_LOCK = threading.Lock()
+_RETRY_REGISTRY: MutableMapping[str, float] = {}
 
 
 class _RecentDuplicateFilter(logging.Filter):
@@ -112,6 +141,113 @@ def _describe_current_thread() -> str:
     return f"{thread.name}#{ident}"
 
 
+def _current_thread_is_urgent() -> bool:
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0)
+    if depth > 0:
+        return True
+    if _URGENT_ALLOWANCE_CHECK is not None:
+        try:
+            if bool(_URGENT_ALLOWANCE_CHECK()):
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _notify_call_waiters() -> None:
+    with _CALL_CONDITION:
+        _CALL_CONDITION.notify_all()
+
+
+def _acquire_call_slot(spec_key: str, thread_label: str) -> bool:
+    """Serialize access to the underlying LLM client.
+
+    Returns ``True`` when the caller holds the slot as part of an urgent chain.
+    The return value is only used for diagnostics; releasing the slot is handled
+    through :func:`_release_call_slot`.
+    """
+
+    global _CALL_OWNER, _CALL_DEPTH, _WAITING_URGENT
+
+    ident = threading.get_ident()
+    if ident is None:
+        ident = id(threading.current_thread())
+
+    with _CALL_CONDITION:
+        if _CALL_OWNER == ident:
+            _CALL_DEPTH += 1
+            return _current_thread_is_urgent()
+
+        is_urgent = _current_thread_is_urgent()
+        wait_started: Optional[float] = None
+        acquired = False
+
+        if is_urgent:
+            _WAITING_URGENT += 1
+
+        try:
+            while True:
+                owner_free = _CALL_OWNER is None
+                manual_guard = _is_global_urgent_active()
+
+                if owner_free:
+                    if is_urgent:
+                        break
+                    # Bloque les appels de fond tant qu'une chaîne urgente est
+                    # active ou qu'un appel urgent attend déjà le slot.
+                    if not manual_guard and _WAITING_URGENT == 0:
+                        break
+                else:
+                    if _CALL_OWNER == ident:
+                        break
+
+                if wait_started is None:
+                    wait_started = time.time()
+                    LOGGER.info(
+                        "LLM spec '%s' en file d'attente pour le slot (thread %s)",
+                        spec_key,
+                        thread_label,
+                    )
+                _CALL_CONDITION.wait(timeout=0.2)
+            acquired = True
+        finally:
+            if is_urgent and not acquired:
+                _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
+
+        if is_urgent:
+            _WAITING_URGENT = max(0, _WAITING_URGENT - 1)
+
+        if wait_started is not None:
+            LOGGER.info(
+                "LLM spec '%s' obtient le slot après %.2fs (thread %s)",
+                spec_key,
+                time.time() - wait_started,
+                thread_label,
+            )
+
+        _CALL_OWNER = ident
+        _CALL_DEPTH = 1
+        return is_urgent
+
+
+def _release_call_slot() -> None:
+    global _CALL_OWNER, _CALL_DEPTH
+
+    ident = threading.get_ident()
+    if ident is None:
+        ident = id(threading.current_thread())
+
+    with _CALL_CONDITION:
+        if _CALL_OWNER != ident:
+            return
+        if _CALL_DEPTH > 1:
+            _CALL_DEPTH -= 1
+            return
+        _CALL_OWNER = None
+        _CALL_DEPTH = 0
+        _CALL_CONDITION.notify_all()
+
+
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
         _ACTIVITY_LOG.appendleft(
@@ -140,6 +276,8 @@ def _await_urgent_clearance(
     wait_started: Optional[float] = None
 
     while True:
+        if _current_thread_is_urgent():
+            break
         active = _is_global_urgent_active()
         if not active and _URGENT_ACTIVE_CHECK is not None:
             try:
@@ -230,6 +368,7 @@ def _recompute_global_urgent_state() -> None:
         _URGENT_CLEAR_EVENT.clear()
     else:
         _URGENT_CLEAR_EVENT.set()
+    _notify_call_waiters()
 
 
 def update_urgent_state(active: bool) -> None:
@@ -247,6 +386,8 @@ def manual_urgent_enter() -> None:
     global _MANUAL_URGENT_COUNT
     with _URGENT_STATE_LOCK:
         _MANUAL_URGENT_COUNT += 1
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0) + 1
+    _THREAD_LOCAL.manual_urgent_depth = depth
     _recompute_global_urgent_state()
 
 
@@ -257,12 +398,38 @@ def manual_urgent_exit() -> None:
     with _URGENT_STATE_LOCK:
         if _MANUAL_URGENT_COUNT > 0:
             _MANUAL_URGENT_COUNT -= 1
+    depth = getattr(_THREAD_LOCAL, "manual_urgent_depth", 0)
+    if depth > 1:
+        _THREAD_LOCAL.manual_urgent_depth = depth - 1
+    elif depth == 1:
+        try:
+            delattr(_THREAD_LOCAL, "manual_urgent_depth")
+        except AttributeError:
+            pass
     _recompute_global_urgent_state()
 
 
 def _is_global_urgent_active() -> bool:
     with _URGENT_STATE_LOCK:
         return _GLOBAL_URGENT_STATE
+
+
+def is_urgent_mode_active() -> bool:
+    """Expose whether an urgent chain is currently active anywhere in the system."""
+
+    return _is_global_urgent_active()
+
+
+def current_thread_is_urgent() -> bool:
+    """Return ``True`` if the caller belongs to an urgent execution context."""
+
+    return _current_thread_is_urgent()
+
+
+def should_defer_background_llm() -> bool:
+    """Indicate whether background LLM calls should defer due to urgent work."""
+
+    return _is_global_urgent_active() and not _current_thread_is_urgent()
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -287,6 +454,7 @@ class LLMIntegrationManager:
         self._enabled = _llm_env_enabled() if enabled is None else bool(enabled)
         self._model_configs: MutableMapping[str, OllamaModelConfig] = dict(model_configs or {})
         self._lock = threading.Lock()
+        self._last_model_used: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -308,18 +476,27 @@ class LLMIntegrationManager:
         if not self._enabled:
             raise LLMUnavailableError("LLM integration is disabled")
 
+        thread_label = _describe_current_thread()
         if not skip_urgent_gate:
-            _await_urgent_clearance(spec_key, logger=logger)
+            _, thread_label = _await_urgent_clearance(
+                spec_key,
+                logger=logger,
+                thread_label=thread_label,
+            )
 
-        spec = get_spec(spec_key)
-        instructions: list[str] = list(spec.extra_instructions)
-        if extra_instructions:
-            instructions.extend(instr.strip() for instr in extra_instructions if instr and instr.strip())
-        instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
+        _acquire_call_slot(spec_key, thread_label)
 
         try:
+            spec = get_spec(spec_key)
+            instructions: list[str] = list(spec.extra_instructions)
+            if extra_instructions:
+                instructions.extend(
+                    instr.strip() for instr in extra_instructions if instr and instr.strip()
+                )
+            instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
+
             result = self._client.generate_json(
-                self._resolve_model(spec.preferred_model),
+                model_config,
                 spec.prompt_goal,
                 input_data=input_payload,
                 extra_instructions=instructions,
@@ -328,8 +505,10 @@ class LLMIntegrationManager:
             )
         except LLMCallError as exc:  # pragma: no cover - delegated to integration error
             raise LLMIntegrationError(f"LLM call failed for spec '{spec_key}': {exc}") from exc
+        finally:
+            _release_call_slot()
 
-        return LLMInvocation(spec=spec, result=result)
+        return LLMInvocation(spec=spec, result=result, model_used=model_config.name)
 
     def call_dict(
         self,
@@ -355,6 +534,10 @@ class LLMIntegrationManager:
                 f"Spec '{spec_key}' returned a non-mapping payload: {type(parsed).__name__}"
             )
         return parsed
+
+    def get_last_model_used(self) -> Optional[str]:
+        with self._lock:
+            return self._last_model_used
 
     def _resolve_model(self, model_name: str) -> OllamaModelConfig:
         with self._lock:
@@ -394,7 +577,11 @@ def try_call_llm_dict(
     input_payload: Any | None = None,
     extra_instructions: Optional[Sequence[str]] = None,
     logger: Optional[Any] = None,
-    max_retries: int = 1,
+    max_retries: int = 3,
+    backoff_base: float = 0.5,
+    backoff_jitter: float = 0.25,
+    dedupe_key: Optional[str] = None,
+    session: Optional["SessionContext"] = None,
 ) -> Optional[Mapping[str, Any]]:
     """Attempt to call the shared LLM and return a mapping payload.
 
@@ -431,7 +618,7 @@ def try_call_llm_dict(
             input_payload=input_payload,
             extra_instructions=extra_instructions,
             max_retries=max_retries,
-            skip_urgent_gate=True,
+            skip_urgent_gate=False,
             logger=logger,
         )
         now = time.time()
@@ -483,9 +670,104 @@ def try_call_llm_dict(
                     exc,
                     exc_info=True,
                 )
-            except Exception:
-                pass
+            except Exception as log_exc:  # pragma: no cover - best effort logging
+                LOGGER.debug(
+                    "Failed to emit warning for unexpected LLM error on spec '%s': %s",
+                    spec_key,
+                    log_exc,
+                    exc_info=True,
+                )
+        if dedupe_key:
+            with _RETRY_LOCK:
+                _RETRY_REGISTRY[dedupe_key] = request_ts
         return None
+
+    attempt = 0
+    delay = max(0.0, float(backoff_base))
+    last_exc: Optional[Exception] = None
+    while attempt <= max_retries:
+        call_started_at = time.time()
+        try:
+            manager = get_llm_manager()
+            payload = manager.call_dict(
+                spec_key,
+                input_payload=input_payload,
+                extra_instructions=extra_instructions,
+                max_retries=0,
+                skip_urgent_gate=False,
+                session=session,
+                logger=logger,
+            )
+            now = time.time()
+            total_duration = now - request_ts
+            call_duration = now - call_started_at
+            LOGGER.info(
+                "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+                spec_key,
+                total_duration,
+                call_duration,
+                thread_label,
+            )
+            _record_activity(spec_key, "success", None)
+            if dedupe_key:
+                with _RETRY_LOCK:
+                    _RETRY_REGISTRY[dedupe_key] = now
+            if session is not None and session.locked_model is None:
+                model_used = manager.get_last_model_used()
+                if model_used:
+                    session.lock_model(model_used)
+            return payload
+        except (LLMUnavailableError, LLMIntegrationError) as exc:
+            attempt += 1
+            last_exc = exc
+            now = time.time()
+            total_duration = now - request_ts
+            LOGGER.warning(
+                "LLM spec '%s' indisponible après %.2fs (tentative %d/%d) – thread %s : %s",
+                spec_key,
+                total_duration,
+                attempt,
+                max_retries,
+                thread_label,
+                exc,
+            )
+            _record_activity(spec_key, "error", str(exc))
+            if attempt > max_retries:
+                break
+            sleep_for = delay + random.uniform(0.0, max(0.0, backoff_jitter))
+            LOGGER.debug("Retrying LLM spec '%s' après %.2fs", spec_key, sleep_for)
+            time.sleep(max(0.0, sleep_for))
+            delay = min(delay * 2.0, 8.0)
+            continue
+        except Exception as exc:  # pragma: no cover - unexpected failure safety net
+            last_exc = exc
+            now = time.time()
+            total_duration = now - request_ts
+            LOGGER.exception(
+                "Erreur inattendue pour la spec LLM '%s' après %.2fs – thread %s",
+                spec_key,
+                total_duration,
+                thread_label,
+            )
+            _record_activity(spec_key, "error", str(exc))
+            if logger is not None:
+                try:
+                    logger.warning(
+                        "Unexpected error while calling LLM integration '%s': %s",
+                        spec_key,
+                        exc,
+                        exc_info=True,
+                    )
+                except Exception:
+                    pass
+            break
+
+    if logger is not None and last_exc is not None:
+        try:
+            logger.debug("LLM integration '%s' failed after retries: %s", spec_key, last_exc)
+        except Exception:
+            pass
+    return None
 
 
 __all__ = [
@@ -494,10 +776,13 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "current_thread_is_urgent",
+    "is_urgent_mode_active",
     "manual_urgent_enter",
     "manual_urgent_exit",
     "get_llm_manager",
     "get_recent_llm_activity",
+    "should_defer_background_llm",
     "is_llm_enabled",
     "register_urgent_gate",
     "set_llm_manager",

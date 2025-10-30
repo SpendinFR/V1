@@ -7,9 +7,10 @@ import logging
 import math
 import os
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
@@ -20,6 +21,33 @@ LOGGER = logging.getLogger(__name__)
 
 def _now() -> float:
     return time.time()
+
+def _strip_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value or "")
+    folded = _strip_accents(normalized).casefold()
+    return " ".join(folded.strip().split())
+
+
+def normalize_goal_signature(
+    description: str,
+    criteria: Optional[Iterable[str]] = None,
+    parent_ids: Optional[Iterable[str]] = None,
+) -> str:
+    desc = _normalize_text(description)
+    crit = tuple(
+        sorted(
+            _normalize_text(item)
+            for item in (criteria or [])
+            if isinstance(item, str) and _normalize_text(item)
+        )
+    )
+    parents = tuple(sorted(str(pid) for pid in (parent_ids or [])))
+    return repr((desc, crit, parents))
 
 
 @dataclass
@@ -40,6 +68,10 @@ class GoalNode:
     parent_ids: List[str] = field(default_factory=list)
     child_ids: List[str] = field(default_factory=list)
     evidence: List[Dict[str, Any]] = field(default_factory=list)
+    priority_last_review_at: float = 0.0
+    priority_last_signature: str = ""
+    signature: str = ""
+    last_action_type: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -151,6 +183,9 @@ class DagStore:
         os.makedirs(os.path.dirname(self.persist_path), exist_ok=True)
         self.nodes: Dict[str, GoalNode] = {}
         self.active_goal_id: Optional[str] = None
+        self._signature_index: Dict[str, str] = {}
+        self.priority_review_cooldown = 30.0
+        self.priority_review_max_age = 600.0
         self.priority_model = OnlinePriorityModel(
             feature_names=[
                 "value",
@@ -269,6 +304,23 @@ class DagStore:
         urgency: float = 0.3,
         parent_ids: Optional[List[str]] = None,
     ) -> GoalNode:
+        parent_ids_list = list(parent_ids or [])
+        signature = normalize_goal_signature(description, criteria, parent_ids_list)
+        existing_id = self._signature_index.get(signature)
+        if existing_id:
+            existing = self.nodes.get(existing_id)
+            if existing:
+                existing.updated_at = _now()
+                existing.evidence.append(
+                    {
+                        "t": _now(),
+                        "event": "duplicate_goal_attempt",
+                        "source": created_by,
+                        "note": "ignored identical goal",
+                    }
+                )
+                self._persist()
+                return existing
         gid = str(uuid.uuid4())[:8]
         node = GoalNode(
             id=gid,
@@ -279,9 +331,10 @@ class DagStore:
             curiosity=float(max(0.0, min(1.0, curiosity))),
             urgency=float(max(0.0, min(1.0, urgency))),
             created_by=created_by,
-            parent_ids=list(parent_ids or []),
+            parent_ids=parent_ids_list,
         )
         self.nodes[gid] = node
+        self._register_signature(node, signature=signature)
         for pid in node.parent_ids:
             parent = self.nodes.get(pid)
             if parent and gid not in parent.child_ids:
@@ -297,6 +350,8 @@ class DagStore:
         child = self.nodes.get(child_id)
         if not parent or not child:
             return
+        if self._creates_cycle(parent_id, child_id):
+            raise ValueError(f"Cycle detected when linking {parent_id}->{child_id}")
         if child_id not in parent.child_ids:
             parent.child_ids.append(child_id)
         if parent_id not in child.parent_ids:
@@ -304,6 +359,24 @@ class DagStore:
         parent.updated_at = _now()
         child.updated_at = _now()
         self._persist()
+
+    def _creates_cycle(self, parent_id: str, child_id: str) -> bool:
+        if parent_id == child_id:
+            return True
+        visited: Set[str] = set()
+        stack: List[str] = [parent_id]
+        while stack:
+            current = stack.pop()
+            if current == child_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            node = self.nodes.get(current)
+            if not node:
+                continue
+            stack.extend(node.parent_ids)
+        return False
 
     def update_goal(self, goal_id: str, updates: Dict[str, Any]) -> Optional[GoalNode]:
         node = self.nodes.get(goal_id)
@@ -313,6 +386,7 @@ class DagStore:
         status_before = node.status
         progress_changed = False
         completion_event = False
+        signature_dirty = False
         for key, value in updates.items():
             if not hasattr(node, key):
                 continue
@@ -331,6 +405,16 @@ class DagStore:
                     }
                 )
                 progress_changed = True
+            elif key == "criteria":
+                node.criteria = list(value or [])
+                signature_dirty = True
+            elif key == "parent_ids":
+                node.parent_ids = list(value or [])
+                signature_dirty = True
+            elif key == "description":
+                if isinstance(value, str):
+                    node.description = value
+                    signature_dirty = True
             else:
                 setattr(node, key, value)
         if progress_changed and node.progress >= 0.999 and node.status not in {"done", "abandoned"}:
@@ -352,6 +436,8 @@ class DagStore:
             self._record_feedback(node, success=True, note="progress_completion")
         elif completion_event and status_before != "done":
             self._record_feedback(node, success=True, note="status_completion")
+        if signature_dirty:
+            self._register_signature(node)
         self._persist()
         return node
 
@@ -421,8 +507,82 @@ class DagStore:
         pool.sort(key=lambda n: n.priority, reverse=True)
         return pool[:k]
 
+    def choose_next_goal(self) -> Dict[str, Any]:
+        top = self.topk(1, only_pending=False)
+        if not top:
+            return {"id": None, "evi": 0.0, "progress": 0.0}
+        node = top[0]
+        return {
+            "id": node.id,
+            "evi": node.priority,
+            "progress": node.progress,
+            "status": node.status,
+        }
+
+    def bump_progress(self, goal_id: Optional[str], delta: float = 0.01) -> float:
+        if not goal_id:
+            return 0.0
+        node = self.nodes.get(goal_id)
+        if not node:
+            return 0.0
+        try:
+            delta_val = float(delta)
+        except (TypeError, ValueError):
+            delta_val = 0.0
+        new_progress = max(0.0, min(1.0, node.progress + max(0.0, delta_val)))
+        if abs(new_progress - node.progress) <= 1e-6:
+            return node.progress
+        node.progress = new_progress
+        node.updated_at = _now()
+        node.evidence.append(
+            {
+                "t": _now(),
+                "event": "progress_auto_bump",
+                "delta": delta_val,
+                "source": "autonomy",
+            }
+        )
+        self._propagate_progress_from(node)
+        self._recompute_priority(node)
+        self._persist()
+        return node.progress
+
+    def has_goal_signature(self, signature: str) -> bool:
+        return signature in self._signature_index
+
+    def find_by_signature(self, signature: str) -> Optional[GoalNode]:
+        gid = self._signature_index.get(signature)
+        if not gid:
+            return None
+        return self.nodes.get(gid)
+
     # ------------------------------------------------------------------
     # Internal helpers
+    def _register_signature(
+        self,
+        node: GoalNode,
+        *,
+        signature: Optional[str] = None,
+        overwrite: bool = True,
+    ) -> None:
+        computed = signature or normalize_goal_signature(
+            node.description, node.criteria, node.parent_ids
+        )
+        if overwrite and node.signature and self._signature_index.get(node.signature) == node.id:
+            self._signature_index.pop(node.signature, None)
+        node.signature = computed
+        existing_id = self._signature_index.get(computed)
+        if existing_id and existing_id != node.id:
+            node.evidence.append(
+                {
+                    "t": _now(),
+                    "event": "signature_conflict",
+                    "existing_goal_id": existing_id,
+                }
+            )
+            return
+        self._signature_index[computed] = node.id
+
     def _recompute_priority(self, node: GoalNode) -> None:
         value = max(0.0, min(1.0, node.value))
         urgency = max(0.0, min(1.0, node.urgency))
@@ -434,7 +594,13 @@ class DagStore:
         adaptive_score = self.priority_model.predict(adaptive_features)
         blend = self.priority_model.confidence()
         fallback_priority = (1.0 - blend) * base + blend * adaptive_score
-        review = self._llm_review_priority(node, base, adaptive_score, fallback_priority)
+        signature = self._priority_signature(node, adaptive_features, base, adaptive_score, fallback_priority)
+        now_ts = _now()
+        review: Optional[Dict[str, Any]] = None
+        if self._should_review_priority(node, signature, now_ts):
+            review = self._llm_review_priority(node, base, adaptive_score, fallback_priority)
+            node.priority_last_review_at = now_ts
+            node.priority_last_signature = signature
         if review:
             priority = review.get("priority", fallback_priority)
             if review.get("reason") or review.get("notes"):
@@ -480,6 +646,39 @@ class DagStore:
             "status_pending": status_pending,
         }
         return features
+
+    def _priority_signature(
+        self,
+        node: GoalNode,
+        features: Dict[str, float],
+        base_priority: float,
+        adaptive_score: float,
+        fallback_priority: float,
+    ) -> str:
+        summary = {
+            "base": round(float(base_priority), 4),
+            "adaptive": round(float(adaptive_score), 4),
+            "fallback": round(float(fallback_priority), 4),
+            "status": node.status,
+            "progress": round(float(node.progress), 4),
+        }
+        for key in sorted(features.keys()):
+            summary[f"f_{key}"] = round(float(features[key]), 4)
+        return json.dumps(summary, sort_keys=True)
+
+    def _should_review_priority(self, node: GoalNode, signature: str, now_ts: float) -> bool:
+        last_signature = getattr(node, "priority_last_signature", "")
+        last_ts = getattr(node, "priority_last_review_at", 0.0) or 0.0
+        if signature != last_signature:
+            # Always allow when the feature signature has changed.
+            if now_ts - last_ts < self.priority_review_cooldown and last_signature:
+                return False
+            return True
+        if not last_signature:
+            return True
+        if now_ts - last_ts >= self.priority_review_max_age:
+            return True
+        return False
 
     @staticmethod
     def _completion_importance(duration: float) -> float:
@@ -535,6 +734,9 @@ class DagStore:
             except TypeError:
                 continue
         self.nodes = nodes
+        self._signature_index = {}
+        for node in self.nodes.values():
+            self._register_signature(node, overwrite=False)
         self.active_goal_id = data.get("active_goal_id")
         if "priority_model" in data:
             try:
@@ -574,7 +776,11 @@ class DagStore:
             child_progress: List[float] = []
             for cid in parent.child_ids:
                 child = self.nodes.get(cid)
-                if child:
+                if not child:
+                    continue
+                if child.status == "abandoned":
+                    child_progress.append(min(0.1, max(0.0, child.progress)))
+                elif child.status in {"done", "active", "pending"}:
                     child_progress.append(max(0.0, min(1.0, child.progress)))
             if not child_progress:
                 continue
@@ -593,49 +799,3 @@ class DagStore:
             )
             self._recompute_priority(parent)
             queue.extend(parent.parent_ids)
-
-
-class GoalDAG:
-    """Lightweight view for quick goal sampling."""
-
-    def __init__(self, path: str):
-        self.path = path
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._state = {"id": "maintain_loop", "evi": 0.5, "progress": 0.1}
-        self._load()
-
-    def _load(self) -> None:
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            return
-        if isinstance(data, dict):
-            self._state.update(data)
-
-    def choose_next_goal(self) -> Dict[str, Any]:
-        return dict(self._state)
-
-    def update_goal(self, goal_id: str, evi: float, progress: float) -> None:
-        self._state.update({"id": goal_id, "evi": float(evi), "progress": float(progress)})
-        try:
-            with open(self.path, "w", encoding="utf-8") as fh:
-                json.dump(json_sanitize(self._state), fh, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def bump_progress(self, delta: float = 0.01) -> float:
-        cur = float(self._state.get("progress", 0.0))
-        cur = min(1.0, max(0.0, cur + float(delta)))
-        self._state["progress"] = cur
-        try:
-            self._save()  # si tu as déjà _save(); sinon ignore
-        except Exception:
-            try:
-                with open(self.path, "w", encoding="utf-8") as fh:
-                    json.dump(json_sanitize(self._state), fh, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        return cur

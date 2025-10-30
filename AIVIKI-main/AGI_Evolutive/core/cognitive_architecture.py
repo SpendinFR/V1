@@ -21,7 +21,6 @@ from AGI_Evolutive.core.question_manager import QuestionManager
 from AGI_Evolutive.creativity import CreativitySystem
 from AGI_Evolutive.emotions import EmotionalSystem
 from AGI_Evolutive.goals import GoalSystem, GoalType
-from AGI_Evolutive.goals.dag_store import GoalDAG
 from AGI_Evolutive.io.action_interface import ActionInterface
 from AGI_Evolutive.io.perception_interface import PerceptionInterface
 from AGI_Evolutive.language.understanding import SemanticUnderstanding
@@ -83,8 +82,6 @@ class CognitiveArchitecture:
         self.intent_model = IntentModel()
         self.question_manager = QuestionManager(self)
         self._last_intent_decay = time.time()
-        self.goal_dag = GoalDAG("runtime/goal_dag.json")
-
         # Global state
         self.global_activation = 0.5
         self.start_time = time.time()
@@ -759,6 +756,15 @@ class CognitiveArchitecture:
 
     # ------------------------------------------------------------------
     # Status & reporting
+    def _goal_focus_snapshot(self) -> Dict[str, Any]:
+        goal_system = getattr(self, "goals", None)
+        if not goal_system:
+            return {"id": None, "evi": 0.0, "progress": 0.0}
+        try:
+            return goal_system.store.choose_next_goal()
+        except Exception:
+            return {"id": None, "evi": 0.0, "progress": 0.0}
+
     def _present_subsystems(self) -> Dict[str, bool]:
         names = [
             "memory",
@@ -789,7 +795,7 @@ class CognitiveArchitecture:
             "working_memory_load": float(wm_load),
             "subsystems": self._present_subsystems(),
             "style_policy": self.style_policy.as_dict(),
-            "goal_focus": self.goal_dag.choose_next_goal(),
+            "goal_focus": self._goal_focus_snapshot(),
         }
 
     def diagnostic_snapshot(self, tail: int = 30) -> Dict[str, Any]:

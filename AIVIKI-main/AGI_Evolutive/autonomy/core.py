@@ -9,7 +9,7 @@ import logging
 
 from typing import Any, Dict, List, Mapping, Optional
 
-from AGI_Evolutive.goals.dag_store import GoalDAG
+from AGI_Evolutive.goals.dag_store import DagStore
 from AGI_Evolutive.reasoning.structures import (
     Evidence,
     Hypothesis,
@@ -28,7 +28,7 @@ class AutonomyCore:
     exécute UNE petite étape, logge, et propose un prochain test.
     """
 
-    def __init__(self, arch, logger: JSONLLogger, dag: GoalDAG):
+    def __init__(self, arch, logger: JSONLLogger, dag: DagStore):
         self.arch = arch
         self.logger = logger
         self.dag = dag
@@ -87,7 +87,11 @@ class AutonomyCore:
         self._tick += 1
         # 1) Choix d'objectif
         pick = self.dag.choose_next_goal()
-        goal_id, evi, progress = pick["id"], pick["evi"], pick["progress"]
+        goal_id = pick.get("id") if isinstance(pick, dict) else None
+        if not goal_id:
+            return
+        evi = float(pick.get("evi", 0.0)) if isinstance(pick, dict) else 0.0
+        progress = float(pick.get("progress", 0.0)) if isinstance(pick, dict) else 0.0
 
         # 2) Hypothèse & test minimal
         # Prépare signaux pour le modèle online (avec EMA adaptatives).
@@ -192,7 +196,7 @@ class AutonomyCore:
 
         # 4) Mise à jour DAG + logs
         progress_step = max(0.002, min(0.02, prior * 0.02))
-        progress_after = self.dag.bump_progress(progress_step)
+        progress_after = self.dag.bump_progress(goal_id, progress_step)
         ep = episode_record(
             user_msg="[idle]",
             hypotheses=h,

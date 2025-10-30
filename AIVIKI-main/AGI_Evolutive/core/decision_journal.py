@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional
 
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.core.trace import current_trace_id
 
 
 LOGGER = logging.getLogger(__name__)
@@ -17,27 +19,32 @@ class DecisionJournal:
     def __init__(self, memory_store=None) -> None:
         self.memory = memory_store
         self._open: Dict[str, Dict] = {}
+        self._lock = threading.RLock()
 
-    def new(self, decision_ctx: Dict) -> str:
+    def new(self, decision_ctx: Dict, *, trace_id: Optional[str] = None) -> str:
         decision_id = f"dec:{uuid.uuid4().hex[:12]}"
-        self._open[decision_id] = {
-            "decision_id": decision_id,
-            "ctx": decision_ctx,
-            "ts_start": time.time(),
-            "trace_id": None,
-            "action": None,
-            "expected_score": None,
-        }
+        trace = trace_id or current_trace_id()
+        with self._lock:
+            self._open[decision_id] = {
+                "decision_id": decision_id,
+                "ctx": decision_ctx,
+                "ts_start": time.time(),
+                "trace_id": trace,
+                "action": None,
+                "expected_score": None,
+            }
         return decision_id
 
     def attach_trace(self, decision_id: str, trace_id: str) -> None:
-        if decision_id in self._open:
-            self._open[decision_id]["trace_id"] = trace_id
+        with self._lock:
+            if decision_id in self._open:
+                self._open[decision_id]["trace_id"] = trace_id
 
     def commit_action(self, decision_id: str, action: Dict, expected_score: float) -> None:
-        if decision_id in self._open:
-            self._open[decision_id]["action"] = action
-            self._open[decision_id]["expected_score"] = float(expected_score)
+        with self._lock:
+            if decision_id in self._open:
+                self._open[decision_id]["action"] = action
+                self._open[decision_id]["expected_score"] = float(expected_score)
 
     def _llm_payload(self, decision: Dict[str, Any], obtained_score: float, latency_ms: float) -> Dict[str, Any]:
         ctx = decision.get("ctx", {}) if isinstance(decision.get("ctx"), dict) else {}
@@ -63,6 +70,7 @@ class DecisionJournal:
             "decision_journal",
             input_payload=self._llm_payload(decision, obtained_score, latency_ms),
             logger=LOGGER,
+            dedupe_key=f"decision::{decision.get('decision_id')}",
         )
         if isinstance(response, dict):
             return dict(response)
@@ -99,31 +107,33 @@ class DecisionJournal:
         }
 
     def close(self, decision_id: str, obtained_score: float, latency_ms: Optional[float] = None) -> None:
-        decision = self._open.get(decision_id)
-        if not decision:
-            return
-        ts_end = time.time()
-        if latency_ms is None:
-            latency_ms = 1000.0 * (ts_end - decision["ts_start"])
-        latency_ms = float(latency_ms)
+        with self._lock:
+            decision = self._open.get(decision_id)
+            if not decision:
+                return
+            ts_end = time.time()
+            if latency_ms is None:
+                latency_ms = 1000.0 * (ts_end - decision["ts_start"])
+            latency_ms = float(latency_ms)
 
-        llm_bundle = self._llm_summary(decision, float(obtained_score), latency_ms)
-        if not llm_bundle:
-            llm_bundle = self._fallback_summary(decision, float(obtained_score), latency_ms)
+            llm_bundle = self._llm_summary(decision, float(obtained_score), latency_ms)
+            if not llm_bundle:
+                llm_bundle = self._fallback_summary(decision, float(obtained_score), latency_ms)
 
-        outcome = {
-            "kind": "decision",
-            "decision_id": decision_id,
-            "trigger": decision["ctx"].get("trigger"),
-            "mode": decision["ctx"].get("mode"),
-            "action": decision.get("action"),
-            "expected_score": decision.get("expected_score", 1.0),
-            "obtained_score": float(obtained_score),
-            "latency_ms": float(latency_ms),
-            "trace_id": decision.get("trace_id"),
-            "ts": ts_end,
-            "llm": llm_bundle,
-        }
-        if self.memory is not None:
-            self.memory.add(outcome)
-        del self._open[decision_id]
+            outcome = {
+                "kind": "decision",
+                "schema_version": 1,
+                "decision_id": decision_id,
+                "trigger": decision["ctx"].get("trigger"),
+                "mode": decision["ctx"].get("mode"),
+                "action": decision.get("action"),
+                "expected_score": decision.get("expected_score", 1.0),
+                "obtained_score": float(obtained_score),
+                "latency_ms": float(latency_ms),
+                "trace_id": decision.get("trace_id") or current_trace_id(),
+                "ts": ts_end,
+                "llm": llm_bundle,
+            }
+            if self.memory is not None:
+                self.memory.add(outcome)
+            del self._open[decision_id]

@@ -50,6 +50,20 @@ from AGI_Evolutive.core.self_model import SelfModel
 from AGI_Evolutive.core.telemetry import Telemetry
 from AGI_Evolutive.core.timeline_manager import TimelineManager
 from AGI_Evolutive.core.trigger_types import Trigger, TriggerType
+from AGI_Evolutive.core.session_context import (
+    SessionContext,
+    SessionContextManager,
+    clear_current_session,
+    set_current_session,
+)
+from AGI_Evolutive.core.payload_validation import (
+    validate_boundary,
+    validate_intent,
+    validate_plan,
+    validate_action,
+    validate_action_result,
+)
+from AGI_Evolutive.core.errors import ErrorReport, FatalError, RetryableError, ValidationError
 from AGI_Evolutive.emotions.emotion_engine import EmotionEngine
 from AGI_Evolutive.goals.curiosity import CuriosityEngine
 from AGI_Evolutive.io.action_interface import ActionInterface
@@ -69,6 +83,7 @@ from AGI_Evolutive.phenomenology import (
     PhenomenalQuestioner,
     PhenomenalRecall,
 )
+from AGI_Evolutive.runtime.resource_lock import ResourceLockRegistry
 from AGI_Evolutive.runtime.system_monitor import SystemMonitor
 from AGI_Evolutive.utils.llm_service import (
     LLMIntegrationError,
@@ -181,8 +196,17 @@ def _get_process_memory_kb() -> float:
 
 
 def _normalize_text(text: str) -> str:
-    base = unicodedata.normalize("NFKD", text or "")
-    return "".join(ch for ch in base if not unicodedata.combining(ch)).lower()
+    normalized = unicodedata.normalize("NFC", text or "")
+    casefolded = normalized.casefold()
+    stripped = unicodedata.normalize("NFKD", casefolded)
+    return "".join(ch for ch in stripped if not unicodedata.combining(ch))
+
+
+def _clamp01(value: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
 
 
 class OnlinePlattCalibrator:
@@ -1065,6 +1089,9 @@ class Orchestrator:
     def __init__(self, arch):
         load_config()
         self.arch = arch
+        self._session_manager = SessionContextManager()
+        self._resource_locks = ResourceLockRegistry()
+        self._active_session: Optional[SessionContext] = None
         logger.info(
             "Initialisation de l'Orchestrateur",
             extra={"pipelines_registrees": len(REGISTRY)},
@@ -1183,6 +1210,110 @@ class Orchestrator:
                     setattr(arch_memory, "phenomenal_recall", self.phenomenal_recall)
         except Exception:
             pass
+
+    # --- Session helpers --------------------------------------------------
+    def _activate_session(self, user_id: str = "default", session_id: str = "default") -> SessionContext:
+        ctx = self._session_manager.get(user_id, session_id)
+        self._active_session = ctx
+        set_current_session(ctx)
+        return ctx
+
+    def _deactivate_session(self) -> None:
+        self._active_session = None
+        clear_current_session()
+
+    @property
+    def session_state(self) -> SessionContext:
+        if self._active_session is None:
+            return self._activate_session()
+        return self._active_session
+
+    def _session_default(self, name: str, value: Any) -> None:
+        self._session_manager.set_default(name, value)
+
+    @property
+    def _current_decision_id(self) -> Optional[str]:
+        return self.session_state.get("current_decision_id")
+
+    @_current_decision_id.setter
+    def _current_decision_id(self, value: Optional[str]) -> None:
+        self.session_state.set("current_decision_id", value)
+        self._session_default("current_decision_id", value)
+
+    @property
+    def _current_trace_id(self) -> Optional[str]:
+        return self.session_state.last_trace_id
+
+    @_current_trace_id.setter
+    def _current_trace_id(self, value: Optional[str]) -> None:
+        ctx = self.session_state
+        if value is None:
+            ctx.clear_trace()
+        else:
+            ctx.last_trace_id = value
+            ctx.trace_started_at = time.time()
+        self._session_default("last_trace_id", ctx.last_trace_id)
+
+    @property
+    def _current_reasoning_trace(self) -> Optional[str]:
+        return self.session_state.get("current_reasoning_trace")
+
+    @_current_reasoning_trace.setter
+    def _current_reasoning_trace(self, value: Optional[str]) -> None:
+        self.session_state.set("current_reasoning_trace", value)
+        self._session_default("current_reasoning_trace", value)
+
+    @property
+    def _sj_conf_cache(self) -> Dict[str, Any]:
+        return self.session_state.ensure_default(
+            "sj_conf_cache", dict(self._sj_config_model.current_config())
+        )
+
+    @_sj_conf_cache.setter
+    def _sj_conf_cache(self, value: Dict[str, Any]) -> None:
+        snapshot = dict(value)
+        self.session_state.set("sj_conf_cache", snapshot)
+        self._session_default("sj_conf_cache", snapshot)
+
+    @property
+    def last_user_msg(self) -> Optional[str]:
+        return self.session_state.get("last_user_msg")
+
+    @last_user_msg.setter
+    def last_user_msg(self, value: Optional[str]) -> None:
+        self.session_state.set("last_user_msg", value)
+        self._session_default("last_user_msg", value)
+
+    @property
+    def _last_prediction_error(self) -> float:
+        return float(self.session_state.ensure_default("last_prediction_error", 0.0))
+
+    @_last_prediction_error.setter
+    def _last_prediction_error(self, value: float) -> None:
+        self.session_state.set("last_prediction_error", float(value))
+        self._session_default("last_prediction_error", float(value))
+
+    @property
+    def _last_contradiction(self) -> bool:
+        return bool(self.session_state.ensure_default("last_contradiction", False))
+
+    @_last_contradiction.setter
+    def _last_contradiction(self, value: bool) -> None:
+        self.session_state.set("last_contradiction", bool(value))
+        self._session_default("last_contradiction", bool(value))
+
+    @property
+    def _last_beliefs_by_topic(self) -> Dict[str, List[Dict[str, Any]]]:
+        mapping = self.session_state.ensure_default("last_beliefs_by_topic", {})
+        if not isinstance(mapping, dict):
+            mapping = {}
+            self.session_state.set("last_beliefs_by_topic", mapping)
+        return mapping
+
+    @_last_beliefs_by_topic.setter
+    def _last_beliefs_by_topic(self, value: Dict[str, List[Dict[str, Any]]]) -> None:
+        self.session_state.set("last_beliefs_by_topic", dict(value))
+        self._session_default("last_beliefs_by_topic", dict(value))
         try:
             setattr(self._meta, "phenomenal_journal", self.phenomenal_journal)
             setattr(self._meta, "phenomenal_recall", self.phenomenal_recall)
@@ -1511,6 +1642,7 @@ class Orchestrator:
             "orchestrator_needs",
             input_payload=llm_context,
             logger=logger,
+            dedupe_key=f"needs::{drive}::{int(timestamp)}",
         )
         if isinstance(llm_result, Mapping):
             protocol = str(llm_result.get("protocol") or "").strip()
@@ -1837,6 +1969,27 @@ class Orchestrator:
             blended = 0.7 * fallback_conf + 0.3 * conf
             label, conf = fallback_label, blended
 
+        try:
+            validated_intent = validate_intent({"intent": label, "confidence": conf})
+        except ValidationError as exc:
+            telemetry = getattr(self, "telemetry", None)
+            if telemetry:
+                try:
+                    telemetry.log(
+                        "invalid_intent",
+                        "perception",
+                        {"reason": str(exc), "raw_label": label, "raw_conf": conf},
+                        level="error",
+                        trace_id=self._current_trace_id,
+                        error=ErrorReport(code=exc.code, message=str(exc)),
+                    )
+                except Exception:
+                    pass
+            validated_intent = validate_intent({"intent": "inform", "confidence": 0.0})
+
+        label = validated_intent.intent
+        conf = validated_intent.confidence
+
         MAP = {
             "ask_info": "GOAL",
             "request": "GOAL",
@@ -1873,7 +2026,13 @@ class Orchestrator:
             "uncertainty": max(0.0, 1.0 - float(conf or 0.0)),
         }
 
-        payload = {"text": txt, "label": label, "conf": conf}
+        payload = {
+            "text": txt,
+            "label": label,
+            "conf": conf,
+            "intent": label,
+            "confidence": conf,
+        }
         if tname == "GOAL":
             if is_question:
                 payload["goal_kind"] = "AnswerUserQuestion"
@@ -2251,17 +2410,37 @@ class Orchestrator:
         return alerts
 
     # --- Cycle principal ----------------------------------------------------
-    def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
+    def run_once_cycle(
+        self,
+        user_msg: Optional[str] = None,
+        *,
+        user_id: str = "default",
+        session_id: str = "default",
+        cycle_metrics: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        session_ctx = self._activate_session(user_id, session_id)
+        if cycle_metrics is None:
+            cycle_metrics = {}
+        cycle_metrics.setdefault("session_id", session_id)
+        cycle_metrics.setdefault("user_id", user_id)
         try:
-            prioritizer = getattr(self.arch, "prioritizer", None)
-            if prioritizer is not None:
-                prioritizer.reprioritize_all()
-        except Exception:
-            pass
+            try:
+                prioritizer = getattr(self.arch, "prioritizer", None)
+                if prioritizer is not None:
+                    prioritizer.reprioritize_all()
+            except Exception:
+                pass
 
         jm = getattr(self, "job_manager", None)
         with ExitStack() as cycle_stack:
             cycle_ctx_id: Optional[str] = None
+            if user_msg:
+                try:
+                    manual_urgent_enter()
+                except Exception:
+                    pass
+                else:
+                    cycle_stack.callback(manual_urgent_exit)
             if user_msg and jm and hasattr(jm, "activate_urgent_context"):
                 try:
                     cycle_ctx_id = jm.activate_urgent_context(["SIGNAL"])
@@ -2271,11 +2450,18 @@ class Orchestrator:
                     if hasattr(jm, "deactivate_urgent_context"):
                         cycle_stack.callback(jm.deactivate_urgent_context, cycle_ctx_id)
 
-            if not jm or not hasattr(jm, "has_active_urgent_chain") or not jm.has_active_urgent_chain():
-                self.scheduler.tick()
+            allow_scheduler = not bool(user_msg)
+            if allow_scheduler:
+                if not jm or not hasattr(jm, "has_active_urgent_chain") or not jm.has_active_urgent_chain():
+                    self.scheduler.tick()
+                else:
+                    try:
+                        logger.debug("Skip scheduler tick: urgent chain active")
+                    except Exception:
+                        pass
             else:
                 try:
-                    logger.debug("Skip scheduler tick: urgent chain active")
+                    logger.debug("Skip scheduler tick: user interaction in progress")
                 except Exception:
                     pass
 
@@ -2992,18 +3178,23 @@ class Orchestrator:
                     }
                     if decision_journal:
                         try:
-                            self._current_decision_id = decision_journal.new(decision_ctx)
+                            self._current_decision_id = decision_journal.new(
+                                decision_ctx, trace_id=self.session_state.last_trace_id
+                            )
                         except Exception:
                             self._current_decision_id = None
                     current_topic = getattr(self, "_current_topic", None)
                     if reasoning_ledger:
                         try:
-                            self._current_trace_id = reasoning_ledger.start_trace(topic=current_topic)
+                            desired_trace = self.session_state.last_trace_id
+                            ledger_trace = reasoning_ledger.start_trace(
+                                topic=current_topic, trace_id=desired_trace
+                            )
+                            self._current_reasoning_trace = ledger_trace
                         except Exception:
-                            self._current_trace_id = None
+                            self._current_reasoning_trace = None
                     if (
                         decision_journal
-                        and reasoning_ledger
                         and self._current_decision_id
                         and self._current_trace_id
                     ):
@@ -3033,6 +3224,29 @@ class Orchestrator:
                         ctx["scratch"]["frame"] = self.cognition.planner.frame(
                             trigger, stop_rules={"max_options": 3, "max_seconds": 900}
                         )
+                        frame = ctx["scratch"].get("frame")
+                        if isinstance(frame, Mapping):
+                            try:
+                                plan_payload = validate_boundary("Plan", frame, validate_plan)
+                            except ValidationError as exc:
+                                if telemetry:
+                                    try:
+                                        telemetry.log(
+                                            "invalid_plan",
+                                            "planning",
+                                            {"reason": str(exc)},
+                                            level="error",
+                                            trace_id=self._current_trace_id,
+                                            error=ErrorReport(code=exc.code, message=str(exc)),
+                                        )
+                                    except Exception:
+                                        pass
+                                raise
+                            else:
+                                sanitized = dict(frame)
+                                sanitized["summary"] = plan_payload.summary
+                                sanitized["steps"] = list(plan_payload.steps)
+                                ctx["scratch"]["frame"] = sanitized
                     finally:
                         if monitor:
                             monitor.on_reflect_end()
@@ -3062,7 +3276,30 @@ class Orchestrator:
                         monitor.set_depth(ctx_depth)
                     decision = policy_engine.decide(ctx) if policy_engine else {}
                     ctx["decision"] = decision
-                    ctx["expected"] = decision.get("expected", {"score": 1.0})
+                    if isinstance(decision, Mapping):
+                        try:
+                            validate_boundary("Action", decision.get("action"), validate_action)
+                        except ValidationError as exc:
+                            self.telemetry.log(
+                                "invalid_action",
+                                "policy",
+                                {"reason": str(exc)},
+                                level="error",
+                                trace_id=self._current_trace_id,
+                                error=ErrorReport(code=exc.code, message=str(exc)),
+                            )
+                            raise
+                        expected_payload = decision.get("expected") or {"score": 1.0}
+                        if isinstance(expected_payload, Mapping):
+                            expected_payload = dict(expected_payload)
+                            expected_payload["score"] = _clamp01(expected_payload.get("score", 1.0))
+                            ctx["expected"] = expected_payload
+                            decision["expected"] = expected_payload
+                        else:
+                            ctx["expected"] = {"score": 1.0}
+                            decision["expected"] = ctx["expected"]
+                    else:
+                        ctx["expected"] = {"score": 1.0}
                     if (
                         decision_journal
                         and self._current_decision_id
@@ -3127,7 +3364,7 @@ class Orchestrator:
                     obtained_score = (
                         1.0
                         if (result and result.get("status") in ("ok", "done", "success"))
-                        else float((ctx.get("obtained") or {"score": 0.0}).get("score", 0.0))
+                        else _clamp01((ctx.get("obtained") or {"score": 0.0}).get("score", 0.0))
                     )
                     if selection.family == "HABIT":
                         habit_payload = (ctx.get("scratch", {}) or {}).get("habit_payload", {})
@@ -3147,15 +3384,18 @@ class Orchestrator:
                             decision_journal.close(self._current_decision_id, obtained_score)
                         except Exception:
                             pass
-                    if reasoning_ledger and self._current_trace_id:
+                    ledger_trace = self._current_reasoning_trace
+                    if reasoning_ledger and ledger_trace:
                         try:
                             reasoning_ledger.end_trace(
-                                self._current_trace_id,
+                                ledger_trace,
                                 expected=(decision.get("expected") or {}).get("score", 1.0),
                                 obtained=obtained_score,
                             )
                         except Exception:
                             pass
+                        else:
+                            self._current_reasoning_trace = None
                     try:
                         self.self_model.register_decision(
                             {
@@ -3208,8 +3448,8 @@ class Orchestrator:
                     except Exception:
                         pass
                 elif stg is Stage.FEEDBACK:
-                    exp = float(ctx["expected"].get("score", 1.0))
-                    obt = float((ctx.get("obtained") or {"score": 0.0}).get("score", 0.0))
+                    exp = _clamp01(ctx["expected"].get("score", 1.0))
+                    obt = _clamp01((ctx.get("obtained") or {"score": 0.0}).get("score", 0.0))
                     err = abs(obt - exp)
                     ctx["scratch"]["raw_prediction_error"] = err
                     reward_signal = max(0.0, min(1.0, 1.0 - err))

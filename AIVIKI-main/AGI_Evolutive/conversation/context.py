@@ -49,8 +49,11 @@ def _safe_float(value: Any, default: float) -> float:
 
 
 def _normalize_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "")
-    return text.strip()
+    normalized = unicodedata.normalize("NFC", text or "")
+    casefolded = normalized.casefold()
+    stripped = unicodedata.normalize("NFKD", casefolded)
+    base = "".join(ch for ch in stripped if not unicodedata.combining(ch))
+    return base.strip()
 
 
 @dataclass
