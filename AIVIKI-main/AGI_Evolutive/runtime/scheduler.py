@@ -26,7 +26,7 @@ import random
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
