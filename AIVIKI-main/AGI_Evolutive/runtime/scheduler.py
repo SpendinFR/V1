@@ -26,7 +26,8 @@ import random
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
+from collections import deque
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.core.global_workspace import GlobalWorkspace
@@ -505,13 +506,29 @@ class Scheduler:
         triggers: Optional[Sequence[str]] = None,
         predicate: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
     ):
+        base_interval = 0.0
+        interval_val = 0.0
+        policy: Optional[AdaptiveTaskPolicy] = None
+        if interval_s is not None:
+            try:
+                base_interval = float(interval_s)
+            except Exception:
+                base_interval = 0.0
+        if base_interval > 0.0:
+            policy = self._init_policy(name, base_interval)
+            interval_val = policy.current_interval
+            self.state["policies"][name] = policy.to_state()
+        else:
+            self._policies.pop(name, None)
+            self.state["policies"].pop(name, None)
+
         policy = self._init_policy(name, float(interval_s))
         trigger_set = None
         if triggers:
             trigger_set = {str(event).strip() for event in triggers if str(event).strip()}
         self.tasks[name] = {
             "fn": fn,
-            "interval": policy.current_interval,
+            "interval": interval_val,
             "jitter": float(jitter_s),
             "policy": policy,
             "base_interval": float(interval_s),
@@ -856,6 +873,9 @@ class Scheduler:
                 interval = policy.current_interval
             elapsed = now - last
             if interval > 0.0 and elapsed < interval:
+                continue
+            self._run_task(name, cfg, event=event, payload=payload)
+
                 remaining = interval - elapsed
                 if rerun_after is None or remaining < rerun_after:
                     rerun_after = remaining
@@ -930,46 +950,14 @@ class Scheduler:
 
     def _loop(self):
         while self.running and self.state.get("enabled", True):
+            event_payload = self._wait_for_event()
+            if event_payload is None:
+                break
+            event, payload = event_payload
             if self._should_pause_for_urgent_chain():
+                self._schedule_delayed_event(event, payload, 0.3)
                 continue
-            now = _now()
-            for name, cfg in self.tasks.items():
-                last = float(self.state["last_runs"].get(name, 0.0))
-                policy = cfg.get("policy")
-                interval = cfg.get("interval", 0.0)
-                if policy is not None:
-                    interval = policy.current_interval
-                due = last + interval
-                if now >= due:
-                    # jitter léger
-                    j = cfg["jitter"]
-                    if j > 0:
-                        time.sleep(min(j, 0.25))  # lissé
-
-                    t0 = _now()
-                    ok = True
-                    err = None
-                    try:
-                        cfg["fn"]()
-                    except Exception as e:
-                        ok = False
-                        err = f"{e}\n{traceback.format_exc()}"
-                    t1 = _now()
-
-                    self.state["last_runs"][name] = t1
-                    duration = t1 - t0
-                    if policy is not None:
-                        self._update_task_policy(name, policy, ok, duration)
-                        cfg["interval"] = policy.current_interval
-                    if policy is not None:
-                        self.state["policies"][name] = policy.to_state()
-                    _write_json(self.paths["state"], self.state)
-                    _append_jsonl(self.paths["log"], {
-                        "t0": t0, "t1": t1, "dt": duration, "task": name, "ok": ok, "err": err,
-                        "interval": interval,
-                        "next_interval": cfg.get("interval"),
-                    })
-            time.sleep(0.5)
+            self._process_event(event, payload)
 
     # ---------- coordination with job manager ----------
     def _resolve_job_manager(self) -> Optional["JobManager"]:
