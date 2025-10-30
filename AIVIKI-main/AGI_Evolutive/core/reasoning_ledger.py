@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from AGI_Evolutive.core.trace import current_trace_id
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
 
 
@@ -36,6 +38,7 @@ class CounterExample:
 @dataclass
 class Trace:
     trace_id: str
+    parent_trace_id: Optional[str] = None
     topic: Optional[str] = None
     started_ts: float = field(default_factory=time.time)
     ended_ts: Optional[float] = None
@@ -54,28 +57,45 @@ class ReasoningLedger:
     def __init__(self, memory_store=None) -> None:
         self.memory = memory_store
         self._active: Dict[str, Trace] = {}
+        self._lock = threading.RLock()
 
-    def start_trace(self, topic: str | None = None) -> str:
-        trace_id = f"rt:{uuid.uuid4().hex[:12]}"
-        self._active[trace_id] = Trace(trace_id=trace_id, topic=topic, started_ts=time.time())
-        return trace_id
+    def start_trace(self, topic: str | None = None, trace_id: str | None = None) -> str:
+        parent_trace = trace_id or current_trace_id()
+        trace_key = f"rt:{uuid.uuid4().hex[:12]}"
+        with self._lock:
+            while trace_key in self._active:
+                trace_key = f"rt:{uuid.uuid4().hex[:12]}"
+            self._active[trace_key] = Trace(
+                trace_id=trace_key,
+                parent_trace_id=str(parent_trace) if parent_trace else None,
+                topic=topic,
+                started_ts=time.time(),
+            )
+        return trace_key
 
     def log_premise(self, trace_id: str, source: str, statement: str, confidence: float = 0.5) -> None:
-        trace = self._active.get(trace_id)
-        if trace:
-            trace.premises.append(Premise(statement=statement, source=source, confidence=confidence))
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if trace:
+                trace.premises.append(
+                    Premise(statement=statement, source=source, confidence=confidence)
+                )
 
     def log_option(self, trace_id: str, option_id: str, description: str, scores: Dict[str, float]) -> None:
-        trace = self._active.get(trace_id)
-        if trace:
-            trace.options.append(Option(option_id=option_id, description=description, scores=scores))
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if trace:
+                trace.options.append(
+                    Option(option_id=option_id, description=description, scores=scores)
+                )
 
     def log_counterexample(self, trace_id: str, option_id: str, description: str, severity: float = 0.5) -> None:
-        trace = self._active.get(trace_id)
-        if trace:
-            trace.counterexamples.append(
-                CounterExample(option_id=option_id, description=description, severity=severity)
-            )
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if trace:
+                trace.counterexamples.append(
+                    CounterExample(option_id=option_id, description=description, severity=severity)
+                )
 
     def select_option(
         self,
@@ -84,22 +104,26 @@ class ReasoningLedger:
         justification_text: str,
         stop_rules_hit: bool = False,
     ) -> None:
-        trace = self._active.get(trace_id)
-        if trace:
-            trace.chosen_id = chosen_id
-            trace.justification = justification_text
-            trace.stop_rules_hit = stop_rules_hit
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if trace:
+                trace.chosen_id = chosen_id
+                trace.justification = justification_text
+                trace.stop_rules_hit = stop_rules_hit
 
     def end_trace(self, trace_id: str, expected: float, obtained: float) -> None:
-        trace = self._active.get(trace_id)
-        if not trace:
-            return
-        trace.ended_ts = time.time()
-        error = abs(float(obtained) - float(expected))
-        trace.outcome = {"expected": float(expected), "obtained": float(obtained), "error": error}
-        llm_response = try_call_llm_dict(
-            "reasoning_ledger",
-            input_payload={
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if not trace:
+                return
+            trace.ended_ts = time.time()
+            error = abs(float(obtained) - float(expected))
+            trace.outcome = {
+                "expected": float(expected),
+                "obtained": float(obtained),
+                "error": error,
+            }
+            payload = {
                 "trace_id": trace.trace_id,
                 "topic": trace.topic,
                 "premises": [p.__dict__ for p in trace.premises],
@@ -111,15 +135,21 @@ class ReasoningLedger:
                     "stop_rules_hit": trace.stop_rules_hit,
                 },
                 "outcome": trace.outcome,
-            },
-            logger=LOGGER,
-            max_retries=2,
-        )
-        if self.memory is not None:
-            self.memory.add(
-                {
+            }
+            if trace.parent_trace_id:
+                payload["parent_trace_id"] = trace.parent_trace_id
+            llm_response = try_call_llm_dict(
+                "reasoning_ledger",
+                input_payload=payload,
+                logger=LOGGER,
+                max_retries=2,
+            )
+            if self.memory is not None:
+                entry = {
                     "kind": "reasoning_trace",
+                    "schema_version": 1,
                     "trace_id": trace.trace_id,
+                    "parent_trace_id": trace.parent_trace_id or current_trace_id(),
                     "topic": trace.topic,
                     "premises": [p.__dict__ for p in trace.premises],
                     "options": [o.__dict__ for o in trace.options],
@@ -133,17 +163,20 @@ class ReasoningLedger:
                     "ts": trace.ended_ts,
                     "llm_entry": llm_response.get("entry") if llm_response else None,
                 }
-            )
-        del self._active[trace_id]
+                self.memory.add(entry)
+            self._active.pop(trace_id, None)
 
     def why(self, trace_id: str) -> str:
-        trace = self._active.get(trace_id)
-        if not trace:
-            return "(trace closed or not found)"
-        parts: List[str] = [f"We considered {len(trace.options)} option(s) and chose {trace.chosen_id}."]
-        if trace.justification:
-            parts.append(f"Reason: {trace.justification}.")
-        if trace.counterexamples:
-            tested = ", ".join({c.option_id for c in trace.counterexamples})
-            parts.append(f"Counterexamples were tested against: {tested}.")
-        return " ".join(parts)
+        with self._lock:
+            trace = self._active.get(trace_id)
+            if not trace:
+                return "(trace closed or not found)"
+            parts: List[str] = [
+                f"We considered {len(trace.options)} option(s) and chose {trace.chosen_id}."
+            ]
+            if trace.justification:
+                parts.append(f"Reason: {trace.justification}.")
+            if trace.counterexamples:
+                tested = ", ".join({c.option_id for c in trace.counterexamples})
+                parts.append(f"Counterexamples were tested against: {tested}.")
+            return " ".join(parts)
