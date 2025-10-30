@@ -9,7 +9,10 @@ from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from .analytics import EventPipeline, SnapshotDriftTracker
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    should_defer_background_llm,
+    try_call_llm_dict,
+)
 
 if TYPE_CHECKING:
     from AGI_Evolutive.core.persistence import PersistenceManager
@@ -60,11 +63,17 @@ class JSONLLogger:
             "fields": json_sanitize(fields),
             "metadata": json_sanitize(meta),
         }
-        response = try_call_llm_dict(
-            "jsonl_logger",
-            input_payload=llm_payload,
-            logger=logger,
-        )
+        response = None
+        if should_defer_background_llm():
+            logger.debug(
+                "Skip LLM spec 'jsonl_logger' (urgent chain active)"
+            )
+        else:
+            response = try_call_llm_dict(
+                "jsonl_logger",
+                input_payload=llm_payload,
+                logger=logger,
+            )
         if response:
             llm_fields = {
                 f"llm_{key}": value for key, value in response.items() if f"llm_{key}" not in fields
