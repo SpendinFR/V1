@@ -97,6 +97,16 @@ class PerceptionInterface:
             }
         )
 
+    def _notify_scheduler(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        arch = self.bound.get("arch") or getattr(self, "arch", None)
+        scheduler = getattr(arch, "scheduler", None) if arch is not None else None
+        if not scheduler or not hasattr(scheduler, "notify"):
+            return
+        try:
+            scheduler.notify(event, payload=payload)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Inbox handling
     def step(self, force: bool = False) -> List[str]:
@@ -128,6 +138,10 @@ class PerceptionInterface:
         if added:
             self._index["seen_files"] = sorted(seen)
             self._save_index()
+            try:
+                self._notify_scheduler("inbox_update", {"files": list(added)})
+            except Exception:
+                pass
 
         return added
 
