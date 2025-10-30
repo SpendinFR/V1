@@ -19,6 +19,7 @@ from AGI_Evolutive.autonomy.auto_signals import (
     derive_signals_for_description,
 )
 from AGI_Evolutive.beliefs.graph import Evidence
+from AGI_Evolutive.core.session_context import get_current_session
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict
 
@@ -264,28 +265,16 @@ class ActionInterface:
         self.auto_signal_registry: Optional[AutoSignalRegistry] = None
         self._last_action_scores: Dict[str, Any] = {}
 
-    def _notify_scheduler(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        arch = self.bound.get("arch")
-        scheduler = getattr(arch, "scheduler", None) if arch is not None else None
-        if not scheduler or not hasattr(scheduler, "notify"):
-            return
-        try:
-            scheduler.notify(event, payload=payload)
-        except Exception:
-            pass
-
-    def _notify_action_event(self, action: Action) -> None:
-        payload: Dict[str, Any] = {
-            "action_id": action.id,
-            "action_type": action.type,
-            "status": action.status,
-        }
-        if isinstance(action.result, dict) and "ok" in action.result:
-            try:
-                payload["ok"] = bool(action.result.get("ok"))
-            except Exception:
-                payload["ok"] = action.result.get("ok")
-        self._notify_scheduler("action_completed", payload)
+    def _resolve_auto_signal_cache(self) -> Dict[str, Dict[str, float]]:
+        session = get_current_session()
+        if session is not None:
+            return session.get_cache(
+                "auto_signal_cache",
+                default_factory=dict,
+                ttl=900.0,
+                scope="session",
+            )
+        return self._auto_signal_cache
 
     # ------------------------------------------------------------------
     # Binding helpers
@@ -705,7 +694,8 @@ class ActionInterface:
             intent_payload["skill_request"] = event.get("skill_request")
 
         entry.setdefault("last_enqueued", 0.0)
-        cache = self._auto_signal_cache.setdefault(action_type, {})
+        cache_root = self._resolve_auto_signal_cache()
+        cache = cache_root.setdefault(action_type, {})
         registry = self.auto_signal_registry or self.bound.get("auto_signals")
         hints = metadata.get("keywords")
 
@@ -794,7 +784,8 @@ class ActionInterface:
 
         if not action_type or not isinstance(metrics, Mapping):
             return
-        cache = self._auto_signal_cache.setdefault(str(action_type), {})
+        cache_root = self._resolve_auto_signal_cache()
+        cache = cache_root.setdefault(str(action_type), {})
         registry = self.auto_signal_registry or self.bound.get("auto_signals")
         if registry is not None:
             observations = registry.bulk_record(
@@ -2354,7 +2345,8 @@ class ActionInterface:
     def _collect_signal_observations(self, act: Action) -> Dict[str, float]:
         observed: Dict[str, float] = {}
 
-        cached = self._auto_signal_cache.get(act.type)
+        cache_root = self._resolve_auto_signal_cache()
+        cached = cache_root.get(act.type)
         if isinstance(cached, Mapping):
             observed.update(cached)
 

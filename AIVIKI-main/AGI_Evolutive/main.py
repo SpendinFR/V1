@@ -134,10 +134,11 @@ _FEEDBACK_STATE_PATH = os.path.join("data", "evolution", "cli_feedback_classifie
 
 
 def _normalize_feedback_text(text: str) -> str:
-    base = unicodedata.normalize("NFKD", text or "")
-    base = "".join(ch for ch in base if not unicodedata.combining(ch))
+    normalized = unicodedata.normalize("NFC", text or "")
+    normalized = normalized.casefold()
+    stripped = unicodedata.normalize("NFKD", normalized)
+    base = "".join(ch for ch in stripped if not unicodedata.combining(ch))
     base = base.replace("’", "'")
-    base = base.lower()
     base = re.sub(r"[^a-z0-9+?!\s]", " ", base)
     return re.sub(r"\s+", " ", base).strip()
 

@@ -1,7 +1,8 @@
-import datetime
 import json
 import os
 from typing import Any
+
+from datetime import UTC, datetime
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.utils.llm_client import (
@@ -55,7 +56,7 @@ __all__ = [
 
 
 def now_iso() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def safe_write_json(path: str, obj: Any) -> None:
