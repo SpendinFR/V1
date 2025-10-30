@@ -873,9 +873,6 @@ class Scheduler:
                 interval = policy.current_interval
             elapsed = now - last
             if interval > 0.0 and elapsed < interval:
-                continue
-            self._run_task(name, cfg, event=event, payload=payload)
-
                 remaining = interval - elapsed
                 if rerun_after is None or remaining < rerun_after:
                     rerun_after = remaining
