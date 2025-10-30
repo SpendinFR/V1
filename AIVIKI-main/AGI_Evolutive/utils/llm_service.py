@@ -656,8 +656,17 @@ def try_call_llm_dict(
                     exc,
                     exc_info=True,
                 )
-                return None
-            _RETRY_REGISTRY[dedupe_key] = request_ts
+            except Exception as log_exc:  # pragma: no cover - best effort logging
+                LOGGER.debug(
+                    "Failed to emit warning for unexpected LLM error on spec '%s': %s",
+                    spec_key,
+                    log_exc,
+                    exc_info=True,
+                )
+        if dedupe_key:
+            with _RETRY_LOCK:
+                _RETRY_REGISTRY[dedupe_key] = request_ts
+        return None
 
     attempt = 0
     delay = max(0.0, float(backoff_base))
