@@ -1,0 +1,245 @@
+diff a/AIVIKI-main/AGI_Evolutive/emotions/emotion_engine.py b/AIVIKI-main/AGI_Evolutive/emotions/emotion_engine.py	(rejected hunks)
+@@ -9,65 +9,69 @@ EmotionEngineV2 — moteur émotionnel évolutif, compatible avec l'existant
+ - Meta-contrôle des plugins (gating doux, entropie cible, apprentissage contextuel)
+ - Auto-synthèse de patterns contextuels → plugin émergent latent
+ - Plasticité multi-échelles : demi-vies adaptatives corrélées aux modulateurs
+ - Rituels auto-scénarisés (auto-régulation) avec mémoire synthétique
+ - **Compat 100%** avec l'existant :
+   - API: bind(), register_event(), step(), get_modulators(), get_state(),
+           update_from_recent_memories(), modulate_homeostasis()
+   - Modulateurs: mêmes clés + alias
+     *tone* **et** *language_tone*, *goal_priority_bias* **dict** + *goal_priority_bias_scalar*
+   - Bump explicite de arch.global_activation via activation_delta
+   - Cible de décroissance configurable: vers "mood" (par défaut) ou "neutral"
+ 
+ Auteur: Toi (refonte assistée) — 2025-10-19
+ Licence: MIT
+ """
+ from __future__ import annotations
+ 
+ import logging
+ import os
+ import json
+ import time
+ import math
+ import uuid
+ from collections import defaultdict, deque
+ from dataclasses import dataclass, field, asdict
+-from typing import Dict, Any, Optional, List, Tuple
++from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
+ 
+ from AGI_Evolutive.utils.llm_service import (
+     LLMIntegrationError,
+     LLMUnavailableError,
+     get_llm_manager,
+     is_llm_enabled,
+ )
+ 
+ # ========================= Utilitaires ========================= #
+ 
+ def clip(x: float, lo: float, hi: float) -> float:
+     return lo if x < lo else hi if x > hi else x
+ 
+ 
++if TYPE_CHECKING:  # pragma: no cover - typing helpers only
++    from AGI_Evolutive.phenomenology import PhenomenalJournal
++
++
+ LOGGER = logging.getLogger(__name__)
+ 
+ _POSITIVE_EMOTIONS = {
+     "joie",
+     "fierté",
+     "soulagement",
+     "gratitude",
+     "calme",
+     "confiance",
+     "enthousiasme",
+     "espoir",
+     "satisfaction",
+ }
+ _NEGATIVE_EMOTIONS = {
+     "stress",
+     "colère",
+     "tristesse",
+     "anxiété",
+     "peur",
+     "culpabilité",
+     "frustration",
+     "fatigue",
+     "inquiétude",
+ }
+ 
+@@ -611,75 +615,120 @@ class EmotionEngine:
+         self._synthesizer = ContextAutoSynthesizer()
+         plugins: List[AppraisalPlugin] = [
+             CognitiveLoadPlugin(),
+             ErrorPlugin(),
+             SuccessPlugin(),
+             RewardPlugin(),
+             IntrinsicPleasurePlugin(),
+             FatiguePlugin(),
+             SocialFeedbackPlugin(),
+             SynthesizedPlugin(self._synthesizer),
+         ]
+         self.aggregator = AppraisalAggregator(plugins)
+ 
+         # Plasticité multi-échelles + rituels
+         self._plasticity = HalfLifePlasticity(self.half_life_sec, self.mood_half_life_sec)
+         self._rituals = RitualPlanner()
+ 
+         # Liaison vers d'autres modules
+         self.bound: Dict[str, Any] = {
+             "arch": None,
+             "memory": None,
+             "metacog": None,
+             "goals": None,
+             "language": None,
+             "evolution": None,
++            "phenomenal_journal": None,
+         }
+ 
+         # Épisodes récents
+         self._recent_episodes: List[EmotionEpisode] = []
+         self.max_recent_episodes = 200
+ 
+         # Cache modulators
+         self.last_modulators: Dict[str, Any] = {}
+         self._last_llm_annotation: Optional[Dict[str, Any]] = None
+ 
+         # Charger si présent
+         self.load()
+ 
+     # ---------- Binding ----------
+     def bind(self, arch=None, memory=None, metacog=None, goals=None, language=None, evolution=None):
+         self.bound.update({
+             "arch": arch,
+             "memory": memory,
+             "metacog": metacog,
+             "goals": goals,
+             "language": language,
+             "evolution": evolution,
+         })
++        try:
++            if arch is not None and getattr(arch, "phenomenal_journal", None) is not None:
++                self.bound["phenomenal_journal"] = getattr(arch, "phenomenal_journal")
++        except Exception:
++            pass
+         return self
+ 
++    def _phenomenal_journal(self) -> Optional["PhenomenalJournal"]:
++        journal = self.bound.get("phenomenal_journal")
++        if journal is None:
++            arch = self.bound.get("arch")
++            if arch is not None:
++                journal = getattr(arch, "phenomenal_journal", None)
++                if journal is not None:
++                    self.bound["phenomenal_journal"] = journal
++        return journal
++
++    def _emit_phenomenal_experience(self, experience: Any, context: Optional[Dict[str, Any]]) -> None:
++        journal = self._phenomenal_journal()
++        if journal is None:
++            return
++        try:
++            arch = self.bound.get("arch")
++            values: List[str] = []
++            principles: List[str] = []
++            if arch is not None and hasattr(arch, "self_model"):
++                self_model = getattr(arch, "self_model", None)
++                persona = getattr(self_model, "persona", {}) if self_model else {}
++                if isinstance(persona, dict):
++                    raw_values = persona.get("values")
++                    if isinstance(raw_values, list):
++                        values.extend(str(val) for val in raw_values if isinstance(val, str))
++                identity = getattr(self_model, "identity", {}) if self_model else {}
++                if isinstance(identity, dict):
++                    declared = identity.get("principles")
++                    if isinstance(declared, list):
++                        principles.extend(str(val) for val in declared if isinstance(val, str))
++            journal.record_emotion(
++                experience,
++                context=context or {},
++                values=values,
++                principles=principles,
++            )
++        except Exception:
++            pass
++
+     # ---------- API externe ----------
+     def register_event(self, kind: str, intensity: float = 0.4,
+                        valence_hint: Optional[float] = None,
+                        arousal_hint: Optional[float] = None,
+                        dominance_hint: Optional[float] = None,
+                        confidence: float = 1.0,
+                        meta: Optional[Dict[str, Any]] = None):
+         m = float(clip(intensity, 0.0, 1.0))
+         dv = (valence_hint if valence_hint is not None else 0.0) * m
+         da = (arousal_hint if arousal_hint is not None else 0.0) * m
+         dd = (dominance_hint if dominance_hint is not None else 0.0) * 0.5 * m
+         self._nudge(dv, da, dd, source=f"event:{kind}", confidence=confidence, meta=meta or {})
+ 
+     def register_intrinsic_pleasure(self, intensity: float, meta: Optional[Dict[str, Any]] = None) -> None:
+         try:
+             value = float(intensity)
+         except (TypeError, ValueError):
+             value = 0.0
+         value = clip(value, -1.0, 1.0)
+         self.register_event(
+             "intrinsic_pleasure",
+             intensity=abs(value),
+             valence_hint=value,
+             arousal_hint=0.2 * abs(value),
+             dominance_hint=0.1 * value,
+@@ -1016,50 +1065,51 @@ class EmotionEngine:
+         def lowpass(m, s):
+             return m + (s - m) * (1.0 - math.exp(-k * dt))
+         self.mood.valence = clip(lowpass(self.mood.valence, self.state.valence), -1.0, 1.0)
+         self.mood.arousal = clip(lowpass(self.mood.arousal, self.state.arousal * 0.8), 0.05, 1.0)
+         self.mood.dominance = clip(lowpass(self.mood.dominance, self.state.dominance), 0.0, 1.0)
+         self.mood.t = now
+ 
+     def _estimate_uncertainty(self) -> float:
+         base = clip(0.6 * self.state.arousal + 0.4 * (1.0 - self.state.dominance), 0.0, 1.0)
+         return clip(0.5 * base + 0.5 * (0.5 - 0.5 * self.mood.dominance), 0.0, 1.0)
+ 
+     def _nudge(self, dv: float, da: float, dd: float, source: str, confidence: float, meta: Dict[str, Any]):
+         self.state.valence = clip(self.state.valence + dv, -1.0, 1.0)
+         self.state.arousal = clip(self.state.arousal + da, 0.0, 1.0)
+         self.state.dominance = clip(self.state.dominance + dd, 0.0, 1.0)
+         self.state.label = label_from_pad(self.state.valence, self.state.arousal, self.state.dominance)
+         ep = EmotionEpisode(
+             id=str(uuid.uuid4()), onset=time.time(), dt=self.step_period,
+             dv=dv, da=da, dd=dd, label=self.state.label, confidence=confidence,
+             causes=sorted([(k, float(v)) for k, v in (meta.get("parts") or {}).items()], key=lambda x: -x[1])[:5],
+             meta={k: v for k, v in meta.items() if k != "parts"}
+         )
+         self._recent_episodes.append(ep)
+         if len(self._recent_episodes) > self.max_recent_episodes:
+             self._recent_episodes = self._recent_episodes[-self.max_recent_episodes:]
++        self._emit_phenomenal_experience(ep, {"source": source, **meta})
+         try:
+             with open(self.path_log, "a", encoding="utf-8") as f:
+                 f.write(json.dumps(json_sanitize(asdict(ep)), ensure_ascii=False) + "\n")
+         except Exception:
+             pass
+ 
+     def _goal_priority_bias_dict(self, v: float, a: float, d: float) -> Dict[str, float]:
+         """Reconstruit un dict de biais par domaines (compat ancien code)."""
+         bias: Dict[str, float] = {}
+         # heuristiques simples mais stables
+         if v < -0.2:
+             bias["résolution_problème"] = bias.get("résolution_problème", 0.0) + 0.15
+             bias["apprentissage"] = bias.get("apprentissage", 0.0) + 0.05
+         if a > 0.6:
+             bias["attention"] = bias.get("attention", 0.0) + 0.15
+             bias["prise_décision"] = bias.get("prise_décision", 0.0) + 0.10
+         if v > 0.3:
+             bias["social_cognition"] = bias.get("social_cognition", 0.0) + 0.10
+             bias["langage"] = bias.get("langage", 0.0) + 0.05
+         # clé globale pour consommateurs génériques
+         bias["global"] = clip(0.15 * v + 0.10 * (d - 0.5), -0.3, 0.3)
+         return bias
+ 
+     def _compute_modulators(self) -> Dict[str, Any]:
+         v, a, d = self.state.valence, self.state.arousal, self.state.dominance
