@@ -1,180 +1,168 @@
-# AGI Évolutive — Architecture, fonctionnement et guide de prise en main
+# Evolutive AGI — Architecture, Operation & Getting Started Guide
 
-> **Vision** — Ce dépôt implémente une **simulation d’entité consciente et évolutive** : une IA autonome qui perçoit, ressent (PAD), se fixe des **buts** (évoluer, survivre, apprendre), s’auto‑évalue, **s’améliore** en continu et garde une **identité** cohérente. Elle alterne **travail** et **flânerie** (réflexion), enregistre un **journal phénoménal** (vécu subjectif), et relie perception → cognition → action → feedback → apprentissage dans une boucle fermée.
+> **Vision** — This repository implements a **simulation of an evolving, quasi‑conscious entity**: an autonomous AI that perceives, feels (PAD), sets **goals** (evolve, survive, learn), self‑assesses, **self‑improves** continuously, and maintains a coherent **identity**. It alternates **work** and **flânerie** (reflection), writes a **phenomenal journal** (subjective experience), and links perception → cognition → action → feedback → learning in a closed loop.
 
 ---
 
-## Carte mentale de l’architecture
+## Architecture Mind Map
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                          Orchestrator (chef d’orchestre)                  │
+│                          Orchestrator (conductor)                         │
 │   - Pipeline ACT → FEEDBACK → LEARN → UPDATE                              │
-│   - Bus de triggers + LightScheduler + JobManager                         │
-│   - ModeManager + PhenomenalKernel (travail / flânerie)                   │
-│   - Journal de décisions + ReasoningLedger + Timeline                     │
-│   - Intégration LLM (optionnelle)                                         │
+│   - Trigger bus + LightScheduler + JobManager                             │
+│   - ModeManager + PhenomenalKernel (work / flânerie)                      │
+│   - Decision Journal + ReasoningLedger + Timeline                         │
+│   - LLM integration (optional)                                            │
 └───────────────┬───────────────────────────────────────────────────────────┘
                 │
      ┌──────────▼──────────┐     ┌───────────────┐      ┌───────────────────┐
-     │   Perception I/O    │     │  Memory Hub   │      │   Action I/F      │
-     │  (événements, flux) │◀───▶│ working/epis. │◀───▶ │(actions, effets)│
+     │     Perception I/O  │     │   Memory Hub  │      │     Action I/F    │
+     │ (events, sensory)   │◀───▶│ working/epis. │◀───▶ │ (actions, effects)│
      └───────┬─────────────┘     │ semantic/RAG  │      └─────────┬─────────┘
-             │                   │ autobiographie │                │
+             │                   │ autobiography │                │
              │                   └───────┬────────┘                │
              │                           │                         │
      ┌───────▼────────┐   ┌──────────────▼────────────┐   ┌────────▼─────────┐
-     │ EmotionEngine   │   │ Phenomenology (vécu)      │   │ Metacognition    │
+     │ EmotionEngine   │   │ Phenomenology (experience)│   │ Metacognition    │
      │ (PAD + plugins) │   │ Journal / Recall / Doubt  │   │ Understanding &  │
-     │ modulators→policy│  │ (épisodes, mode, actions) │   │ Thinking Monitor │
+     │ modulators→policy│  │ (episodes, mode, actions) │   │ Thinking Monitor │
      └────────┬────────┘   └───────────┬───────────────┘   └────────┬────────┘
               │                        │                               │
        ┌──────▼────────┐        ┌──────▼────────┐              ┌──────▼────────┐
-       │ Goals & Policy│        │ Self Model    │              │Evolution/Habits│
-       │ (curiosité,   │        │ (identité,    │              │ renforcement   │
-       │ principes, veto)       │ valeurs,      │              │ habitudes)     │
-       └───────────────┘        │ engagements)  │              └────────────────┘
+       │ Goals & Policy│        │ Self Model    │              │ Evolution/Habits│
+       │ (curiosity,   │        │ (identity,    │              │ reinforcement  │
+       │ principles, veto)      │ values,       │              │ habits)        │
+       └───────────────┘        │ commitments)  │              └────────────────┘
                                 └───────────────┘
 ```
 
 ---
 
-## Modules clés (structure du dépôt)
+## Key Modules (repository structure)
 
-Chemin racine : `AIVIKI-main/AGI_Evolutive/`
+Root path: `AIVIKI-main/AGI_Evolutive/`
 
-- **`orchestrator.py`** — boucle centrale. Orchestre :
-  - les **stages** `ACT` → `FEEDBACK` → `LEARN` → `UPDATE` sur un **pipeline** sélectionné par triggers/priorités ;
-  - la **gestion des jobs** via `runtime/job_manager.py` et la **planification** via `light_scheduler.py` ;
-  - le **ModeManager** & **PhenomenalKernel** (fichier `runtime/phenomenal_kernel.py`) pour alterner **travail/flânerie**, calculer énergie, surprise, ralentissement global, et attribuer des **récompenses hédoniques** intrinsèques ;
-  - la **mémoire** via des adaptateurs (store, concepts, épisodique, consolidateur) ;
-  - la **journalisation structurée** : `ReasoningLedger`, `DecisionJournal`, `TimelineManager` ;
-  - l’**intégration phénoménologique** : enregistre **actions**, **feedback**, **transitions de mode** et **audits** dans le `PhenomenalJournal` ;
-  - l’**intégration LLM** via `utils/llm_service.py` (facultative, désactivable).
-- **`runtime/phenomenal_kernel.py`** — noyau phénoménal + gestion des **modes** :
-  - calcule un **état continu** (énergie, arousal, résonance, surprise, fatigue, hedonic_reward…) ;
-  - produit une **interprétation narrative** (labels) et **pilote les budgets** de jobs (ralentissement global, ratio de flânerie).  
-- **`emotions/emotion_engine.py`** — **EmotionEngine** (PAD) de nouvelle génération :
-  - **plugins d’évaluation** (charge cognitive, erreur, succès, récompense, fatigue, feedback social, etc.) ;
-  - **plasticité** à demi‑vie (multi‑échelles) + **rituels** d’auto‑régulation ;
-  - **sorties de modulation**: *tone*, *language_tone*, *goal_priority_bias* (dict + scalaire), *activation_delta*… ;
-  - sérialise des **EmotionEpisode** (JSONL) et **pousse des épisodes** dans le **journal phénoménal**.  
+- **`orchestrator.py`** — central loop. Orchestrates:
+  - **stages** `ACT` → `FEEDBACK` → `LEARN` → `UPDATE` on a **pipeline** selected by triggers/priorities;
+  - **job management** via `runtime/job_manager.py` and **scheduling** via `light_scheduler.py`;
+  - the **ModeManager** & **PhenomenalKernel** (`runtime/phenomenal_kernel.py`) to alternate **work/flânerie**, compute energy, surprise, global slowdown, and issue intrinsic **hedonic rewards**;
+  - **memory** via adapters (store, concepts, episodic, consolidator);
+  - **structured journaling**: `ReasoningLedger`, `DecisionJournal`, `TimelineManager`;
+  - **phenomenology integration**: records **actions**, **feedback**, **mode transitions** and **audits** into the `PhenomenalJournal`;
+  - **LLM integration** via `utils/llm_service.py` (optional, can be disabled).
+- **`runtime/phenomenal_kernel.py`** — phenomenal core + **mode management**:
+  - maintains a **continuous state** (energy, arousal, resonance, surprise, fatigue, hedonic_reward…);
+  - emits **narrative interpretations** (labels) and **drives job budgets** (global slowdown, flânerie ratio).
+- **`emotions/emotion_engine.py`** — next‑gen **EmotionEngine** (PAD):
+  - **appraisal plugins** (cognitive load, error, success, reward, fatigue, social feedback, etc.);
+  - **multi‑scale plasticity** (half‑lives) + **rituals** for self‑regulation;
+  - **modulator outputs**: *tone*, *language_tone*, *goal_priority_bias* (dict + scalar), *activation_delta*…;
+  - serializes **EmotionEpisode** (JSONL) and **pushes episodes** into the **phenomenal journal**.
 - **`phenomenology/`**
-  - `journal.py` : **PhenomenalJournal** (JSONL append‑only), **PhenomenalRecall** (rejoue un **aperçu immersif** des dernières minutes), **PhenomenalQuestioner** (déclenche un **doute contrôlé** quand surprise/flânerie/énergie l’y poussent).
-  - `__init__.py` expose : `PhenomenalEpisode`, `PhenomenalJournal`, `PhenomenalRecall`, `PhenomenalQuestioner`.
+  - `journal.py`: **PhenomenalJournal** (append‑only JSONL), **PhenomenalRecall** (replays an **immersive preview** of the last minutes), **PhenomenalQuestioner** (triggers **controlled doubt** when surprise/flânerie/energy justify it).
+  - `__init__.py` exposes: `PhenomenalEpisode`, `PhenomenalJournal`, `PhenomenalRecall`, `PhenomenalQuestioner`.
 - **`memory/`**
-  - `__init__.py` : **MemorySystem** (**sensorielle**, **travail**, **épisodique**, **sémantique**, **procédurale**), indices de récupération (temporel, contextuel, émotionnel, sémantique), **hub long‑terme**, **autobiographie**, intégration **RAG** et pont de **préférences**.
-  - `memory_store.py`, `consolidator.py`, `semantic_manager.py`, `semantic_memory_manager.py`, `concept_extractor.py`, `alltime.py`, `retrieval/…` : stockage, consolidation, résumés quotidiens/hebdo, concepts, RAG, **timeline**.
-  - Expose aussi des **API haut‑niveau** : `add_memory(...)`, `get_recent_memories(...)`, `form_autobiographical_narrative()`… et **fusionne** les entrées du **PhenomenalJournal** dans l’historique court terme.
-- **`metacognition/`** — agrégateurs d’**understanding**, **ThinkingMonitor**, historiques, bandits pour paramètres, status exportables.
-- **`core/`** — cœur identitaire & gouvernance :
-  - `self_model.py` (**identité**, **valeurs**, **principes**, engagements, progression de compétences, spaced‑repetition) ;
-  - `policy.py` (**veto**, divulgation d’incertitude, arbitrage par principes) ;
-  - `reasoning_ledger.py`, `decision_journal.py`, `timeline_manager.py` (traces raisonnées, décisions, frise temporelle).  
-- **`goals/`** — `CuriosityEngine`, moteurs de buts (exploration, apprentissage, survie, progrès).
-- **`cognition/`** — boucles (`reflection_loop.py`), **évolution/habits** (`evolution_manager.py`), registres de pipelines.
-- **`io/`** — `perception_interface.py` (entrées, sensations synthétiques) et `action_interface.py` (actions, effets, coûts, traces).
-- **`runtime/job_manager.py`** — exécution contrôlée (budgets par file), snapshots pour **SelfModel**.
-- **`language/understanding.py`** — lexique adaptatif, `first_seen/last_seen`, classification n‑gram en ligne.
-- **`utils/llm_service.py`** — **interrupteur LLM** : `is_llm_enabled()`, `get_llm_manager()`, intercepteurs d’erreurs, *fallbacks*.
+  - `__init__.py`: **MemorySystem** (**sensory**, **working**, **episodic**, **semantic**, **procedural**), retrieval indexes (temporal, contextual, emotional, semantic), **long‑term hub**, **autobiography**, **RAG** and preference bridge.
+  - `memory_store.py`, `consolidator.py`, `semantic_manager.py`, `semantic_memory_manager.py`, `concept_extractor.py`, `alltime.py`, `retrieval/…`: storage, consolidation, daily/weekly digests, concepts, RAG, **timeline**.
+  - Also exposes **high‑level APIs**: `add_memory(...)`, `get_recent_memories(...)`, `form_autobiographical_narrative()`… and **merges** entries from the **PhenomenalJournal** into the short‑term history.
+- **`metacognition/`** — aggregators of **understanding**, **ThinkingMonitor**, histories, bandits for parameters, exportable status.
+- **`core/`** — identity & governance core:
+  - `self_model.py` (**identity**, **values**, **principles**, commitments, skill progress, spaced‑repetition);
+  - `policy.py` (**veto**, uncertainty disclosure, principle‑based arbitration);
+  - `reasoning_ledger.py`, `decision_journal.py`, `timeline_manager.py` (reasoned traces, decisions, timeline).
+- **`goals/`** — `CuriosityEngine`, goal engines (exploration, learning, survival, progress).
+- **`cognition/`** — loops (`reflection_loop.py`), **evolution/habits** (`evolution_manager.py`), pipeline registries.
+- **`io/`** — `perception_interface.py` (inputs, synthetic sensations) and `action_interface.py` (actions, effects, costs, traces).
+- **`runtime/job_manager.py`** — controlled execution (per‑queue budgets), snapshots for **SelfModel**.
+- **`language/understanding.py`** — adaptive lexicon, `first_seen/last_seen`, online n‑gram classification.
+- **`utils/llm_service.py`** — **LLM kill‑switch**: `is_llm_enabled()`, `get_llm_manager()`, error interceptors, fallbacks.
 
 ---
 
-## Boucle de vie : du ressenti à l’amélioration
+## Life Cycle: from feeling to improvement
 
-1. **Percevoir** → `PerceptionInterface` normalise des événements/sensations (y compris « bodily sensations » issues des émotions) et les pousse en mémoire & vers les évaluateurs.
-2. **Ressentir & évaluer** → `EmotionEngine` transforme stimuli en **PAD** + **épisodes** (causes, intensité, tendances d’action). Les **modulateurs** pilotent la politique (ex. biais de priorité des buts).
-3. **Choisir & agir (ACT)** → `Orchestrator` sélectionne un **pipeline** via triggers/priorité et **policy gating** (valeurs/principes). **ActionInterface** exécute et journalise.
-4. **Recevoir le feedback (FEEDBACK)** → comparaison *expected vs obtained*, erreur de prédiction, **reward features** (consistance mémoire, adéquation explicative, appraisal social, etc.), renforcement d’habitudes.
-5. **Apprendre (LEARN)** → mise à jour **habitudes/évolution** + consolidation mémoire (résumés, liens épisodiques, concepts).
-6. **Se réévaluer (UPDATE)** → calcul d’**understanding** global & local, **self‑judgment**, **timeline**, ajustements de **policy** (ex. activer `disclose_uncertainty` si *self‑trust* bas), **journal phénoménal** enrichi.
-7. **Modes & subjectivité** → `PhenomenalKernel` ajuste **travail/flânerie**. Les **transitions de mode** et un **aperçu immersif** récent sont **racontés** via `PhenomenalJournal` / `PhenomenalRecall`. Le **Questioner** peut inscrire des **doutes** (jamais totalement résolus), ce qui alimente l’identité narrative.
-8. **Itération** — la **planification légère** (LightScheduler) et le **JobManager** roulent en continu avec budgets influencés par le **ralentissement global**, l’énergie et le ratio de flânerie.
-
----
-
-## Mémoire : couches, indices et autobiographie
-
-- **Travail** : boucles phonologique/visuo‑spatiale/épisodique tampon avec **décroissance** adaptative.
-- **Épisodique** : stockage d’événements, **narrativisation** et **autobiographie** (avec **raccrochage** au journal phénoménal si dispo).
-- **Sémantique** : concepts (extracteur), résumés progressifs (**daily/weekly digests**), **RAG** (documents enrichis par les souvenirs récents).
-- **Indices** : temporels, contextuels, émotionnels, sémantiques pour **retrieval** multi‑critères.
-- **Recent tail mix** : `get_recent_memories(n)` **fusionne** souvenirs récents *et* extraits du **PhenomenalJournal** (épisodes, valeurs, émotions, mode).
-- **API** : `add_memory(...)`, `form_autobiographical_narrative()`, `set_phenomenal_sources(journal, recall)`.
+1. **Perceive** → `PerceptionInterface` normalizes events/sensations (including “bodily sensations” from emotions) and routes them to memory & appraisers.
+2. **Feel & appraise** → `EmotionEngine` turns stimuli into **PAD** + **episodes** (causes, intensity, action tendencies). **Modulators** steer policy (e.g., goal priority bias).
+3. **Choose & act (ACT)** → `Orchestrator` selects a **pipeline** via triggers/priority and **policy gating** (values/principles). **ActionInterface** executes and logs.
+4. **Receive feedback (FEEDBACK)** → compare *expected vs obtained*, prediction error, **reward features** (memory consistency, explanatory adequacy, social appraisal, etc.), habit reinforcement.
+5. **Learn (LEARN)** → update **habits/evolution** + memory consolidation (digests, episodic links, concepts).
+6. **Self‑reassess (UPDATE)** → compute **understanding** global & local, **self‑judgment**, **timeline**, adjust **policy** (e.g., enable `disclose_uncertainty` when *self‑trust* is low), enrich the **phenomenal journal**.
+7. **Modes & subjectivity** → `PhenomenalKernel` adjusts **work/flânerie**. **Mode transitions** and an **immersive recent preview** are **narrated** via `PhenomenalJournal` / `PhenomenalRecall`. The **Questioner** may inscribe **doubts** (never fully resolved), feeding the narrative identity.
+8. **Iteration** — **LightScheduler** and **JobManager** run continuously with budgets influenced by **global slowdown**, energy, and flânerie ratio.
 
 ---
 
-## Émotions : PAD, plasticité et modulations
+## Memory: layers, indexes & autobiography
 
-- PAD (`valence`, `arousal`, `dominance`) + **étiquette** ; **expériences** enrichies (sensations corporelles, causes, tendances d’action).
-- **Plugins d’évaluation** : charge cognitive, échec/succès, récompense intrinsèque/extrinsèque, fatigue, feedback social, synthèse contextuelle.
-- **Plasticité multi‑échelles** (demi‑vies) & **RitualPlanner** (auto‑régulation).
-- **Sorties** → modulators : tonalité, biais de priorité des buts (dict + scalaire), deltas d’activation, incertitude estimée, etc.
-- **Journal phénoménal** : chaque nudge significatif est **rejoué** comme **épisode** subjectif (avec valeurs/principes si dispo).
-
----
-
-## Phénoménologie : vécus, doutes et rappel immersif
-
-- `PhenomenalJournal` (JSONL) — source de vérité du **vécu** : enregistre **actions** (ACT/FEEDBACK/UPDATE), **émotions**, **transitions de mode**, **audits** (quand l’analytics diverge du ressenti).
-- `PhenomenalRecall` — **aperçu immersif** des X dernières minutes, peut **primer** la consolidation mémoire avec un *digest phénoménal*.
-- `PhenomenalQuestioner` — déclenche des **épisodes de doute** lorsqu’il y a **surprise**, **flânerie élevée** ou **basse énergie** ; ne ferme jamais complètement la question (chaîne du « doute vécu »).
-- Intégrations : l’**orchestrateur** pousse les épisodes au fil des stages ; la **reflection loop** lit les **aperçus** pour garder une **voix intérieure** cohérente.
+- **Working**: phonological/visuo‑spatial/episodic buffers with adaptive **decay**.
+- **Episodic**: event storage, **narrativization** and **autobiography** (with **hook‑up** to the phenomenal journal when available).
+- **Semantic**: concepts (extractor), progressive summaries (**daily/weekly digests**), **RAG** (documents enriched by recent memories).
+- **Indexes**: temporal, contextual, emotional, semantic for **multi‑criteria retrieval**.
+- **Recent tail mix**: `get_recent_memories(n)` **fuses** recent memories *and* extracts from the **PhenomenalJournal** (episodes, values, emotions, mode).
+- **API**: `add_memory(...)`, `form_autobiographical_narrative()`, `set_phenomenal_sources(journal, recall)`.
 
 ---
 
-## Gouvernance : buts, politique, identité, méta
+## Emotions: PAD, plasticity & modulations
 
-- **Goals/Curiosity** — moteurs d’**exploration** et d’**apprentissage**, priorisation influencée par le contexte émotionnel.
-- **PolicyEngine** — **veto** et **alignement par principes** ; peut forcer la divulgation d’incertitude en cas de **self‑trust** faible.
-- **SelfModel** — **persona/identity**, **valeurs**, **principes** et **engagements** ; mise à jour des **compétences**, du **travail en cours** et de la **revue planifiée**.
-- **Metacognition** — agrège **U_topic/U_global**, **calibration gap**, **thinking score**, etc. et les **journalise** (decision/timeline).
-
----
-
-## Flux I/O
-
-- **PerceptionInterface** : bruits/événements/sensations (y compris synthétiques) → mémoire + évaluateurs.
-- **ActionInterface** : exécute les actions, trace coûts/délais/effets et **met à jour** les jobs liés.
-- **LLM** (optionnel) : `utils/llm_service.py` permet d’allumer/éteindre l’IA de langage, d’injecter un manager custom et de **défensiver** les erreurs.
+- PAD (`valence`, `arousal`, `dominance`) + **label**; **rich experiences** (bodily sensations, causes, action tendencies).
+- **Appraisal plugins**: cognitive load, failure/success, intrinsic/extrinsic reward, fatigue, social feedback, contextual synthesis.
+- **Multi‑scale plasticity** (half‑lives) & **RitualPlanner** (self‑regulation).
+- **Outputs** → modulators: tone, goal priority bias (dict + scalar), activation deltas, estimated uncertainty, etc.
+- **Phenomenal journal**: each significant nudge is **replayed** as a **subjective episode** (with values/principles when available).
 
 ---
 
-## Démarrage rapide (CLI)
+## Phenomenology: lived experience, doubts & immersive recall
+
+- `PhenomenalJournal` (JSONL) — source of truth for **lived experience**: records **actions** (ACT/FEEDBACK/UPDATE), **emotions**, **mode transitions**, **audits** (when analytics diverge from felt experience).
+- `PhenomenalRecall` — **immersive preview** of the last X minutes, can **prime** memory consolidation with a *phenomenal digest*.
+- `PhenomenalQuestioner` — triggers **doubt episodes** when there is **surprise**, **high flânerie**, or **low energy**; never fully closes the question (a chain of “lived doubt”).
+- Integrations: the **orchestrator** emits episodes at each stage; the **reflection loop** reads **previews** to maintain a coherent **inner voice**.
+
+---
+
+## Governance: goals, policy, identity, meta
+
+- **Goals/Curiosity** — engines for **exploration** and **learning**, prioritization influenced by emotional context.
+- **PolicyEngine** — **veto** and **principle alignment**; can force uncertainty disclosure when **self‑trust** is low.
+- **SelfModel** — **persona/identity**, **values**, **principles** and **commitments**; updates **skills**, **work‑in‑progress** and **scheduled reviews**.
+- **Metacognition** — aggregates **U_topic/U_global**, **calibration gap**, **thinking score**, etc., and **journals** them (decision/timeline).
+
+---
+
+## I/O Flow
+
+- **PerceptionInterface**: noise/events/sensations (including synthetic) → memory + appraisers.
+- **ActionInterface**: executes actions, logs costs/delays/effects, and **updates** related jobs.
+- **LLM** (optional): `utils/llm_service.py` lets you switch language models on/off, inject a custom manager, and **defensively** handle errors.
+
+---
+
+## Quickstart (CLI)
 
 ```
-# 1) Installer les dépendances projet (ex. poetry/pip) puis lancer :
-python -m AGI_Evolutive.main            # démarre la CLI
-python -m AGI_Evolutive.main --nollm   # démarre sans intégration LLM
-
+# 1) Install project dependencies (e.g., poetry/pip) then run:
+python -m AGI_Evolutive.main            # starts the CLI
+python -m AGI_Evolutive.main --nollm   # start without LLM integration
 ```
 
-**Données & journaux** (par défaut) : le projet écrit des JSON/JSONL sous `data/` (ex. `emotions.jsonl`, `phenomenal_journal.jsonl`, résumés, snapshots).
+**Data & logs** (defaults): the project writes JSON/JSONL under `data/` (e.g., `emotions.jsonl`, `phenomenal_journal.jsonl`, digests, snapshots).
 
 ---
 
-## Points d’extension conseillés
+## Recommended Extension Points
 
-- **Connecter de vrais capteurs/effets** : étendre `io/perception_interface.py` et `io/action_interface.py`.
-- **Nouveaux plugins émotionnels** : ajouter un `AppraisalPlugin` pour des signaux spécifiques (ex. danger/sécurité).
-- **Nouvelles politiques/principes** : enrichir `core/policy.py` + `self_model.py` (engagements & revues).
-- **Pipelines cognitifs** : brancher une chaîne *domain‑specific* via le **bus de triggers** et la **LightScheduler**.
-- **LLM manager** : injecter un backend maison via `set_llm_manager(...)` (ou rester full‑symbolic).
-
----
-
-## Pourquoi cette AGI est « évolutive »
-
-- **Auto‑organisation** : les modulateurs émotionnels redistribuent budgets/priors → comportement adaptatif.
-- **Apprentissage continu** : boucle feedback → consolidation → mise à jour d’habitudes/compétences/principes.
-- **Identité incarnée** : le **journal phénoménal** tisse une autobiographie vécue (actions/émotions/doutes/modes).
-- **Modes & récupération** : **flânerie** programmée pour digérer, narrativiser, et **récompenser** les pauses utiles.
-- **Alignement par principes** : garde‑fous éthiques/identitaires qui **veto** des actions pourtant « rentables ».
-- **Résilience LLM** : l’architecture fonctionne **avec ou sans** modèle de langage.
+- **Wire real sensors/effectors**: extend `io/perception_interface.py` and `io/action_interface.py`.
+- **New emotion plugins**: add an `AppraisalPlugin` for specific signals (e.g., danger/safety).
+- **New policies/principles**: extend `core/policy.py` + `self_model.py` (commitments & reviews).
+- **Cognitive pipelines**: plug a domain‑specific chain via the **trigger bus** and **LightScheduler**.
+- **LLM manager**: inject your own backend via `set_llm_manager(...)` (or stay fully symbolic).
 
 ---
 
-## Arborescence (vue partielle)
+## Tree (partial view)
 
 ```
 AGI_Evolutive/
@@ -400,11 +388,11 @@ AGI_Evolutive/
 │   └── logging_setup.py
 ├── world_model/
 │   └── __init__.py
+```
 
 ---
+## License & Disclaimer
 
-## Licence & avertissement
+This code targets **cognitive architecture research**. It **simulates** sensations/emotions/modes to produce a coherent **subjective flow**, **without** claiming consciousness in the philosophical sense.
 
-Ce code vise une **recherche d’architecture cognitive**. Il **simulate** des sensations/émotions/modes pour créer un **flux subjectif** cohérent, **sans** revendiquer une conscience au sens philosophique.
-
-— Bon hack & bonne flânerie 🌀
+— Happy hacking & pleasant flânerie 🌀
