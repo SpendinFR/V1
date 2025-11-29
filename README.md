@@ -1,3 +1,7 @@
+<video src="https://github.com/SpendinFR/V1/releases/download/media/Sequence.01.mp4" controls width="640"></video>
+
+
+
 # Evolutive AGI — Architecture, Operation & Getting Started Guide
 
 > **Vision** — This repository implements a **simulation of an evolving, quasi‑conscious entity**: an autonomous AI that perceives, feels (PAD), sets **goals** (evolve, survive, learn), self‑assesses, **self‑improves** continuously, and maintains a coherent **identity**. It alternates **work** and **flânerie** (reflection), writes a **phenomenal journal** (subjective experience), and links perception → cognition → action → feedback → learning in a closed loop.
