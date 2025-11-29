@@ -1,6 +1,3 @@
-
-
-Vidéo :
 https://github.com/user-attachments/assets/5e7d7c9a-112f-4fba-ae3f-043e9634f55b
 
 
