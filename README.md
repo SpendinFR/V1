@@ -1,8 +1,7 @@
 
 
 Vidéo :
-<video src="https://github.com/SpendinFR/V1/releases/download/media/Sequence.01.mp4" controls width="640"></video>
-
+https://github.com/user-attachments/assets/5e7d7c9a-112f-4fba-ae3f-043e9634f55b
 
 
 # Evolutive AGI — Architecture, Operation & Getting Started Guide
